@@ -1,4 +1,5 @@
 pub mod apibay;
+pub mod eztv;
 pub mod fitgirl;
 pub mod magnet;
 pub mod nyaa;
