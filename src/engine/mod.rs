@@ -1,4 +1,5 @@
 pub mod fake;
+pub mod librqbit_engine;
 
 use std::path::Path;
 
