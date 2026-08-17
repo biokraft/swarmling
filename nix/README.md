@@ -1,4 +1,9 @@
-# Flake install
+# Flake install (legacy Node build)
+
+> **Note:** this packages the pre-Rust TypeScript tree, which still produces a binary named `torlnk`.
+> swarmling is mid-rewrite; a Rust flake producing the `swarmling` binary arrives with the packaging
+> milestone, and this directory is deleted when the TypeScript tree is.
+
 Add this repo to your ```flake.nix```. The package is built using the unstable channel. You can overwrite this by setting ```inputs.nixpkgs.follows = "nixpkgs"``` (if your default is 26.05).
 
 **The binary is executed as ```torlnk```.**
@@ -6,7 +11,7 @@ Add this repo to your ```flake.nix```. The package is built using the unstable c
 ```nix
 inputs = {
   ...
-  torlink.url = "github:baairon/torlink";
+  swarmling.url = "github:biokraft/swarmling";
   ...
 }
 ```
@@ -21,7 +26,7 @@ You can install the package in either home.nix or your configuration.nix dependi
 {
   home.packages = with pkgs; [
     ...
-    inputs.torlink.packages.${pkgs.system}.default
+    inputs.swarmling.packages.${pkgs.system}.default
     ...
   ];
 }
@@ -35,7 +40,7 @@ You can install the package in either home.nix or your configuration.nix dependi
 {
   environment.systemPackages = with pkgs; [
     ...
-    inputs.torlink.packages.${pkgs.system}.default
+    inputs.swarmling.packages.${pkgs.system}.default
     ...
   ];
 }

@@ -1,69 +1,81 @@
-# Contributing to torlink
+# Contributing to swarmling
 
-torlink stays small on purpose. The best way in is to read the code you're about to touch, match how it already works, and keep your change tight. Three recent pull requests set the bar, and this guide points back at them throughout:
+swarmling stays small on purpose. The best way in is to read the code you're about to touch, match how it already works, and keep your change tight.
 
-- [#4](https://github.com/baairon/torlink/pull/4) gave the arrow keys spatial pane navigation without breaking a single existing shortcut.
-- [#5](https://github.com/baairon/torlink/pull/5) turned a cryptic crash on old Node into a one-line "upgrade me" message.
-- [#6](https://github.com/baairon/torlink/pull/6) added copy-magnet, cross-platform, with tests.
-
-None of them were big. All of them fit the grain. That's the whole idea.
+The project is mid-rewrite: it began as a fork of [torlink](https://github.com/baairon/torlink) (TypeScript, Ink, WebTorrent) and is being rebuilt in Rust. New work goes in the Rust tree. The legacy TypeScript tree is still in the repository during the transition and gets deleted once the Rust version reaches parity — don't add to it.
 
 ## Set up
 
 ```sh
-git clone https://github.com/baairon/torlink
-cd torlink
-npm install
-npm run dev
+git clone https://github.com/biokraft/swarmling
+cd swarmling
+cargo build
+cargo run -- search "ubuntu"
 ```
 
-`npm run dev` runs the live TUI through tsx, no build step. The README's [Contributing](README.md#contributing) section has the build variant if you want it.
+Rust 1.88 or newer (`rust-toolchain.toml` pins it).
 
 ## Before you open a PR
 
 Run these and make sure they're clean:
 
 ```sh
-npm run typecheck   # tsc --noEmit, zero errors
-npm test            # vitest, all green
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-Then check your change against the standards below. The pull request template walks you through the same list.
+CI runs all three on Linux, macOS and Windows.
+
+## The one rule that isn't negotiable
+
+**Never write a test — or a script, or an example — that starts a real torrent transfer.** No test may open a live `librqbit::Session`, contact a tracker or DHT node, connect to a peer, or seed data. Pulling someone else's copyrighted material from an automated test is a legal problem for whoever runs the suite, and "it only ran for a second" is not a defence.
+
+This is why the code is shaped the way it is. Everything the app needs from a torrent backend goes through the `TorrentEngine` trait, and the queue, persistence and restore logic are all tested against an in-memory `FakeEngine` that never opens a socket. Exactly one file (`src/engine/librqbit_engine.rs`) knows librqbit exists, and it is verified by compilation and review rather than by being run.
+
+If a change genuinely cannot be verified without real network transfer, say so in the PR and leave it unverified rather than running it.
 
 ## The standards
 
 ### Match the existing grain
 
-Reuse what's there before you write something new. Cursor movement goes through `wrapStep` (`src/ui/move.ts`). Key hints live in the `Hint` / `HELP_GROUPS` / `footerHints` system (`src/ui/keymap.ts`). Shared app state is the `Store` interface (`src/ui/store.ts`).
+Reuse what's there before writing something new. Search sources implement one trait and are listed in one registry. HTTP goes through the shared client in `src/util/net.rs` — don't build a second one. Magnets are built by `build_magnet`, the single chokepoint that validates infohashes; don't assemble a magnet string by hand.
 
-#4 is the model here: it added a whole navigation mode and still introduced no new state, it leaned on the existing `region` and `captureMode` flags and reused `wrapStep`. If you catch yourself adding a parallel way to do something the codebase already does, stop and use the one that's already there.
-
-### Stay additive, never break muscle memory
-
-People already have the current keys in their fingers. New behavior should layer on, not overwrite. #4 lit up the arrow keys (which did nothing before) while leaving tab, enter, esc, and every letter command exactly where they were. If your change retrains an existing key, it needs a real reason and a clear note in the PR.
-
-### Cross-platform or it doesn't ship
-
-torlink runs on Windows, macOS, and Linux, so anything that touches the OS branches all three. Look at `writeClipboard` in `src/util/clipboard.ts` from #6: powershell on win32, pbcopy on darwin, then wl-copy, xclip, xsel on linux. #5's `scripts/cli-entry.cjs` is the same instinct aimed at the Node runtime. "Works on my machine" is not the bar.
+If you catch yourself adding a parallel way to do something the codebase already does, stop and use the one that's already there.
 
 ### Fail soft, never crash
 
-When something the user can't control goes wrong, degrade gracefully and say so. #5 prints a friendly upgrade message and exits cleanly instead of letting old Node spit out a parse error. #6's `writeClipboard` returns `false` and surfaces a notice when no clipboard tool exists, it never throws. Reach for a clear message and a fallback before you reach for an exception.
+When something you don't control goes wrong — a source is down, a feed is malformed, a state file is corrupt — degrade and say so. A dead source produces a warning and the search continues. A corrupt queue file loads as an empty queue rather than bricking the app. Reach for a clear message and a fallback before you reach for a panic.
+
+Remote input is hostile input. Nothing parsed from a website or a feed may be able to panic the process: no unchecked indexing, no `unwrap` on anything fallible, no slicing at an offset you didn't derive safely.
+
+### Cross-platform or it doesn't ship
+
+swarmling runs on Windows, macOS and Linux, so anything touching the OS handles all three. "Works on my machine" is not the bar; CI will tell you.
 
 ### Test the logic
 
-Non-trivial logic gets a vitest test. Pure functions are easy, see `src/util/format.test.ts`. For code that shells out or leans on a platform, mock the node built-in, see `src/util/clipboard.test.ts` from #6 mocking `node:child_process`. Run the suite with `npm test`.
+Non-trivial logic gets a test. Sources are tested against `wiremock` with captured fixtures — never against the live site. Download logic is tested against `FakeEngine`. Filesystem code uses `tempfile`, never a real user directory.
 
-### Wire the UI surface, and keep it minimal
+A regression test that cannot fail is worse than no test, because it looks like protection. If you're adding one for a race or an ordering bug, verify it actually fails against the unfixed code before you submit it.
 
-torlink shows one contextual footer plus a `?` cheatsheet, never a wall of commands. Two rules when you add to it:
+### Adding a search source
 
-- A new key means updating both halves of `src/ui/keymap.ts`: `HELP_GROUPS` (the `?` sheet) and `footerHints` (the footer). #6 did both for `y`.
-- A new `Store` field means adding a matching entry to `makeStore` in `scripts/render-previews-impl.tsx`, or `npm run previews` (the README screenshots) breaks. #6's `copyMagnet` sits in there as a noop for exactly this reason.
+The smallest useful contribution, and deliberately so. One file in `src/sources/`, implementing the `Source` trait, registered in `src/sources/registry.rs`, with wiremock tests covering a normal response and an empty or broken one. Follow an existing source as the template; `apibay.rs` and `yts.rs` are the simplest.
+
+Keep the curation principle in mind: this is a short, hand-picked list, not an index of every tracker. A new source needs a reason to be trusted, and games stay with FitGirl alone.
+
+### Adding a VPN adapter
+
+Also small by design. Implement the `VpnAdapter` trait, shell out to the provider's own CLI, and never handle the user's credentials — swarmling should never see, store, or transmit them. If the provider has no CLI on a given platform, fall back to the core interface detection rather than inventing something.
 
 ### Respect the calm theme
 
-torlink is pastel-violet and quiet. There is exactly one gradient, the wordmark sheen. Everything else is solid color. Please don't add a second gradient.
+swarmling is pastel-violet and quiet. When the terminal UI lands, there will be exactly one gradient — the wordmark. Everything else is solid colour. Please don't add a second gradient.
+
+### Privacy is a feature
+
+No telemetry, no analytics, no phone-home, no "anonymous" usage stats. Not behind a flag, not opt-in. If a change makes the program talk to a server the user didn't ask it to talk to, it doesn't land.
 
 ## Commits and pull requests
 
@@ -71,4 +83,4 @@ torlink is pastel-violet and quiet. There is exactly one gradient, the wordmark 
 - Say why, not just what. The diff already shows the what.
 - One concern per pull request. Two unrelated ideas are two PRs.
 
-Thanks for helping keep torlink sharp.
+Thanks for helping keep swarmling sharp.

@@ -1,5 +1,5 @@
 {
-  description = "Torlink is a torrent finder that lives in your terminal, with zero setup and nothing to configure.";
+  description = "Legacy Node packaging for swarmling's pre-Rust tree. A Rust flake building the `swarmling` binary lands with the packaging milestone.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -26,7 +26,7 @@
         }
       );
       overlays.default = final: prev: {
-        torlink = final.callPackage ./nix/package.nix { };
+        swarmling-legacy = final.callPackage ./nix/package.nix { };
       };
 
     };

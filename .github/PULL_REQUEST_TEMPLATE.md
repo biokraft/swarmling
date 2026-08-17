@@ -4,12 +4,14 @@
 
 ## Checklist
 
-- [ ] `npm run typecheck` is clean
-- [ ] `npm test` passes
-- [ ] New logic has a test (vitest; mock node built-ins for platform code)
-- [ ] If I added a key, I updated both `HELP_GROUPS` and `footerHints` in `src/ui/keymap.ts`
-- [ ] If I added a `Store` field, I updated `makeStore` in `scripts/render-previews-impl.tsx`
-- [ ] OS-touching code works on Windows, macOS, and Linux
+- [ ] `cargo fmt --all --check` is clean
+- [ ] `cargo clippy --all-targets -- -D warnings` is clean
+- [ ] `cargo test` passes
+- [ ] New logic has a test (wiremock for sources, `FakeEngine` for download logic, `tempfile` for filesystem code)
+- [ ] **No test, script or step of mine starts a real torrent transfer** — no live `librqbit::Session`, no tracker, DHT, peer or seeding activity
+- [ ] Nothing parsed from a remote source can panic the process
+- [ ] OS-touching code works on Windows, macOS and Linux
+- [ ] If I added a `QueueEntry` field, it has `#[serde(default)]` so older state files still load
 - [ ] One concern, with a Conventional Commits title (`feat:` / `fix:` / `docs:` / `chore:`)
 
-New here? [CONTRIBUTING.md](../CONTRIBUTING.md) explains each of these with examples from real merged PRs.
+New here? [CONTRIBUTING.md](../CONTRIBUTING.md) explains each of these, including why the torrent rule is absolute.

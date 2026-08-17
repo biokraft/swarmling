@@ -1,44 +1,65 @@
-<p align="center">
-  <img src="preview/splash.svg" alt="torlink, curated torrents straight from your terminal" style="max-width: 832px; width: 100%; height: auto;">
-</p>
+# swarmling
 
-Finding a torrent these days sucks. One site is a minefield of fake download buttons. Another hides the real link under a popup that spawns two more tabs. And after all that, half the results are dead, zero seeders.
+**A terminal torrent finder that respects your VPN, in a single Rust binary.**
 
-torlink is a torrent finder that lives in your terminal, with zero setup and nothing to configure. One search checks a short, curated list of reputable sources at once, and whatever you pick downloads straight to your computer. The files are yours, saved to your downloads folder.
+Finding a torrent is miserable. One site is a minefield of fake download buttons, another hides the real link behind a popup that spawns two more tabs, and half of what survives is dead anyway. swarmling searches a short, curated list of reputable sources at once and hands you the result, from a terminal, with nothing to configure.
 
-## Get started
+It is a hard fork of [torlink](https://github.com/baairon/torlink) — a good idea with a good design — rebuilt in Rust so it ships as one binary with no runtime to install, and so the VPN story can be part of the tool instead of your problem.
 
-1. **Install Node** (from [nodejs.org](https://nodejs.org)), it's all torlink needs.
-2. **Open your terminal.**
-3. **Start it:**
+> **Status: under active rewrite.** Searching works today. Downloading is deliberately not wired to a live torrent session yet — see [Where this is](#where-this-is) before you expect it to pull files down.
 
-   ```sh
-   npx torlnk
-   ```
+## Why this fork exists
 
-That's the only thing you'll type. torlink opens straight to a search bar: search for what you want, paste in a magnet link or a bare infohash, drag a `.torrent` file from your file manager onto the window, or just press Enter on an empty box to browse the curated library. From there it's all keypresses, nothing to memorize, and `?` brings up the full list anytime.
+**One binary, no runtime.** The original runs through `npx`, which means installing Node before you can search for anything. swarmling is a single Rust binary: download it, run it.
 
-## Finding something
+**Your VPN, enforced by the tool.** Most people torrent behind a VPN and hope they configured it right. swarmling's plan is to make that a property of the program: detect the VPN interface, bind all torrent traffic to it, and pause everything the moment the tunnel drops. VPN-agnostic at the core, with adapters for specific providers on top — NordVPN first, the rest open to whoever wants to write one. See [VPN guard](#vpn-guard).
 
-Type what you're looking for and press Enter. Results stream in from every source as they answer, tagged with size and how many people are sharing each one, so you can see what'll come down fast. Arrow to what you want and press `d` to save it, or `shift+d` to pick a different folder for just that download.
+**Nothing phones home.** No telemetry, no analytics, no update pings, ever.
 
-<p align="center">
-  <img src="preview/browse.svg" alt="torlink's browse view: the sidebar, the search bar, and merged results from every source" style="max-width: 832px; width: 100%; height: auto;">
-</p>
+## Where this is
 
-## Your downloads
+The Rust rewrite is being built milestone by milestone. This table is the honest state of the branch, not a roadmap of intentions:
 
-Active downloads sit up top with their progress, speed, and time left; when one finishes it drops into Recently downloaded just below, so the list stays tidy. Everything's still there when you come back, and anything interrupted picks up where it left off.
+| Capability | State |
+| --- | --- |
+| Search across all sources | **Works** |
+| Magnet / infohash parsing | **Works** |
+| Download queue, persisted across restarts | **Works** (records what you asked for) |
+| Actually transferring files | **Not yet wired** — see below |
+| Terminal UI | Planned |
+| VPN guard and kill switch | Planned |
+| Seeding controls, headless and daemon modes | Planned |
 
-Downloads run in the background while you keep searching, so you can queue up as many as you want. They save to your downloads folder, and the Downloads pane keeps tabs on each one; press `o` anytime to change where that is, or grab one result with `shift+d` to send it somewhere else without touching the default. When something finishes it keeps seeding automatically so the next person can find it too, and the Seeding tab lets you pause or stop that anytime.
+Downloading is the interesting omission. The engine adapter is written and tested through its trait, but no command in the current CLI opens a live torrent session — because merely opening one starts talking to trackers and the DHT, and the VPN guard that should sit in front of that traffic does not exist yet. Transfers get wired up when there is a long-running, VPN-guarded process to own them. That ordering is deliberate.
 
-<p align="center">
-  <img src="preview/downloads.svg" alt="torlink's Downloads pane: live progress on top, recently downloaded below" style="max-width: 832px; width: 100%; height: auto;">
-</p>
+## Install
+
+No release binaries yet. From source, with a Rust toolchain:
+
+```sh
+git clone https://github.com/biokraft/swarmling
+cd swarmling
+cargo install --path .
+```
+
+Planned once the rewrite lands: `cargo install swarmling`, `brew install biokraft/tap/swarmling`, an `install.sh`, and a Nix flake.
+
+## Use it
+
+```sh
+swarmling search "ubuntu 24.04"     # search every source at once
+swarmling add "<magnet>"            # queue a download (records intent)
+swarmling add "<magnet>" --paused   # queue it without starting it
+swarmling status                    # what is queued
+swarmling rm <infohash>             # drop it from the queue
+swarmling --help                    # everything else
+```
+
+Search prints one result per line — seeders, size, title, magnet — as each source answers. A source that is down produces a warning on stderr and the search carries on without it.
 
 ## What it searches
 
-A short, hand-picked list of trusted sources:
+A short, hand-picked list, inherited from torlink's philosophy of curation over coverage:
 
 | Category | Sources |
 | --- | --- |
@@ -47,40 +68,26 @@ A short, hand-picked list of trusted sources:
 | TV | EZTV, The Pirate Bay, 1337x, BitTorrented |
 | Anime | Nyaa, SubsPlease |
 
-Games are the only category that can run code, so they come from FitGirl alone, a repacker with a long, trusted track record; everything else is plain video and subtitles. If a source is down, the search carries on without it, and torlink tells you which one is offline.
+Games come from FitGirl alone, deliberately: games are the one category that can execute code, so they come from a single repacker with a long track record rather than from an open index. Everything else is video and subtitles.
 
-## Headless
+## VPN guard
 
-torlink also runs without the TUI, for servers and seedboxes:
+Planned, and the main reason this fork exists. Two layers:
 
-    torlnk watch <dir>    download anything dropped into a folder
-    torlnk serve          take magnets over HTTP
-    torlnk files          stream finished downloads over HTTP
-    torlnk attach         keep the TUI alive across ssh sessions
+**The core works with any VPN, with no configuration.** swarmling finds the active VPN interface (`tun`/`wg`/`utun` and friends), binds torrent traffic to it so nothing leaks onto your bare connection, and watches it. If the interface disappears or its address changes, every torrent pauses immediately and resumes when the tunnel is back.
 
-Add `--daemon` to keep watch, serve, or files running after you log out; `torlnk --help` has the full list of modes and flags.
+**Adapters add provider-specific control** through a small trait — status, interface, connect. Adapters shell out to the provider's own CLI, so no credentials ever pass through swarmling. NordVPN ships first; more are welcome as pull requests, the same way sources are.
+
+## Credit
+
+swarmling exists because [bairon](https://github.com/baairon) built [torlink](https://github.com/baairon/torlink) and released it under the MIT licence. The curated-source philosophy, the category layout, and a good deal of hard-won scraper behaviour came from that project and are preserved here. See [NOTICE](NOTICE).
+
+This fork diverges on implementation language, distribution model, and the VPN feature. It is not affiliated with the original and does not speak for it.
 
 ## Contributing
 
-To run or work on torlink locally:
+[CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the house rules, and where the seams are. Adding a search source or a VPN adapter are both deliberately small, self-contained jobs.
 
-1. Clone the repository and open the folder.
-2. Install dependencies:
-   ```sh
-   npm install
-   ```
-3. Run the development version:
-   ```sh
-   npm run dev
-   ```
-   Or build it and run the bundled version:
-   ```sh
-   npm run build
-   npx torlnk
-   ```
+## Licence
 
-Before opening a PR, skim [CONTRIBUTING.md](CONTRIBUTING.md); it lays out the bar with examples from real merged PRs.
-
-## Privacy
-
-Your files stay on your disk, and nothing routes through a central server; torlink only talks to the torrent network directly. Once a download finishes it keeps seeding by default, sharing it back so the next person can find it just as easily. The network only works because people pass things along, and even a few minutes makes a real difference. If you'd rather not, opt out anytime: open the Seeding tab, press `p` to pause or stop any item, and press it again to pick it back up. Always your call.
+MIT — see [LICENSE](LICENSE).
