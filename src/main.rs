@@ -31,28 +31,6 @@ enum Command {
     },
 }
 
-async fn open_queue() -> anyhow::Result<(
-    swarmling::download::queue::DownloadQueue,
-    std::path::PathBuf,
-)> {
-    use swarmling::config::paths;
-    use swarmling::download::{persist::load_entries, reconcile::restore};
-    use swarmling::engine::librqbit_engine::LibrqbitEngine;
-
-    let state_path = paths::queue_state_path();
-    let engine = std::sync::Arc::new(LibrqbitEngine::new(paths::data_dir().join("session")).await?);
-    let (queue, report) = restore(
-        engine,
-        paths::default_download_dir(),
-        load_entries(&state_path),
-    )
-    .await;
-    for (infohash, error) in &report.failed {
-        eprintln!("warn: could not restore {infohash} ({error})");
-    }
-    Ok((queue, state_path))
-}
-
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = bytes as f64;
@@ -89,43 +67,111 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        // --- add / status / rm -----------------------------------------
+        //
+        // These three commands deliberately never construct a librqbit
+        // `Session` and never touch the network. They are pure manipulation
+        // of the persisted queue file (`queue.json`): `add` appends an
+        // entry, `status` prints what's persisted, `rm` drops an entry.
+        //
+        // A `Session` with default options starts DHT, tracker
+        // communication and local service discovery the instant it is
+        // constructed — before a single torrent is even added — and this
+        // milestone has no VPN guard in front of that traffic yet. A
+        // transfer (and therefore a `Session`) must only ever be started
+        // from an explicit, VPN-guarded, long-running process added in a
+        // later milestone. `reconcile::restore` and `LibrqbitEngine` still
+        // exist and are unit-tested for that future process; the CLI here
+        // just doesn't call them.
         Command::Add {
             magnet,
             title,
             paused,
         } => {
-            let (queue, state_path) = open_queue().await?;
-            let title = title.unwrap_or_else(|| magnet.clone());
-            let infohash = queue.add(&magnet, &title, paused).await?;
-            queue.save(&state_path)?;
-            println!("added {infohash}");
+            use swarmling::config::paths;
+            use swarmling::download::persist::{load_entries, save_entries};
+            use swarmling::download::queue::QueueEntry;
+            use swarmling::sources::magnet::parse_magnet;
+
+            let parsed = match parse_magnet(&magnet) {
+                Some(p) if !p.infohash.is_empty() => p,
+                _ => {
+                    eprintln!("error: magnet has no usable infohash");
+                    std::process::exit(1);
+                }
+            };
+
+            let state_path = paths::queue_state_path();
+            let mut entries = load_entries(&state_path);
+
+            if let Some(existing) = entries.iter().find(|e| e.infohash == parsed.infohash) {
+                println!("already queued: {}", existing.infohash);
+                return Ok(());
+            }
+
+            let title = title.unwrap_or_else(|| {
+                if !parsed.name.is_empty() {
+                    parsed.name.clone()
+                } else {
+                    magnet.clone()
+                }
+            });
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            entries.push(QueueEntry {
+                infohash: parsed.infohash.clone(),
+                magnet: magnet.clone(),
+                title,
+                added_unix: now,
+                paused,
+            });
+            save_entries(&state_path, &entries)?;
+            println!("added {}", parsed.infohash);
         }
         Command::Status => {
-            let (queue, _) = open_queue().await?;
-            let snapshots = queue.snapshots().await;
-            for entry in queue.entries() {
-                let snap = snapshots.iter().find(|s| s.infohash == entry.infohash);
-                let (state, percent) = match snap {
-                    Some(s) if s.total_bytes > 0 => (
-                        format!("{:?}", s.state),
-                        format!(
-                            "{:.1}%",
-                            (s.progress_bytes as f64 / s.total_bytes as f64) * 100.0
-                        ),
-                    ),
-                    Some(s) => (format!("{:?}", s.state), "0.0%".to_string()),
-                    None => ("Unknown".to_string(), "-".to_string()),
-                };
-                println!("{state}\t{percent}\t{}", entry.title);
+            use swarmling::config::paths;
+            use swarmling::download::persist::load_entries;
+
+            let entries = load_entries(&paths::queue_state_path());
+            for entry in entries {
+                // No live engine is attached here, so only the persisted
+                // intent is known: report the `paused` flag, not fabricated
+                // progress.
+                let state = if entry.paused { "Paused" } else { "Queued" };
+                println!("{state}\t-\t{}", entry.title);
             }
         }
         Command::Rm {
             infohash,
             delete_files,
         } => {
-            let (queue, state_path) = open_queue().await?;
-            queue.remove(&infohash, delete_files).await?;
-            queue.save(&state_path)?;
+            use swarmling::config::paths;
+            use swarmling::download::persist::{load_entries, save_entries};
+            use swarmling::sources::magnet::is_infohash;
+
+            if !is_infohash(&infohash) {
+                eprintln!("error: not a valid infohash: {infohash}");
+                std::process::exit(1);
+            }
+
+            if delete_files {
+                println!(
+                    "note: --delete-files is not available until the download engine is attached; no files were deleted"
+                );
+            }
+
+            let state_path = paths::queue_state_path();
+            let mut entries = load_entries(&state_path);
+            let before = entries.len();
+            entries.retain(|e| e.infohash != infohash);
+            if entries.len() == before {
+                eprintln!("warn: no queued entry with infohash {infohash}");
+            }
+            save_entries(&state_path, &entries)?;
             println!("removed {infohash}");
         }
     }

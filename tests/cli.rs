@@ -54,3 +54,25 @@ fn rm_requires_an_infohash_argument() {
         .assert()
         .failure();
 }
+
+#[test]
+fn rm_rejects_a_bare_integer_instead_of_an_infohash() {
+    // librqbit's own parser treats a bare integer as a session INDEX, so a
+    // typo like `rm 0` must be rejected at the CLI before it can reach the
+    // engine and delete an unrelated torrent.
+    Command::cargo_bin("swarmling")
+        .unwrap()
+        .args(["rm", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("infohash"));
+}
+
+#[test]
+fn add_rejects_a_magnet_with_no_usable_infohash() {
+    Command::cargo_bin("swarmling")
+        .unwrap()
+        .args(["add", "magnet:?dn=no+hash+here"])
+        .assert()
+        .failure();
+}
