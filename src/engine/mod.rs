@@ -34,6 +34,8 @@ pub enum EngineError {
     InvalidMagnet(String),
     #[error("torrent backend failed: {0}")]
     Backend(String),
+    #[error("cannot bind traffic to an interface on this platform: {0}")]
+    BindUnsupported(String),
 }
 
 /// Everything swarmling needs from a torrent backend, in swarmling's own

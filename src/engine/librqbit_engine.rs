@@ -57,6 +57,12 @@ impl LibrqbitEngine {
         session_dir: PathBuf,
         device: &str,
     ) -> Result<Self, EngineError> {
+        if crate::vpn::policy::bind_support() == crate::vpn::policy::BindSupport::Unsupported {
+            return Err(EngineError::BindUnsupported(format!(
+                "this platform cannot bind torrent traffic to interface {device:?}; \
+                 refusing to start an unprotected session"
+            )));
+        }
         let mut opts = Self::session_options(session_dir);
         opts.bind_device_name = Some(device.to_string());
         let session = Session::new_with_opts(download_dir, opts)
@@ -220,5 +226,16 @@ mod tests {
             id_or_hash("abcdef").unwrap_err(),
             EngineError::NotFound(_)
         ));
+    }
+
+    // `new_bound` itself is not called here: doing so would construct a real
+    // librqbit `Session`. Instead this pins down the policy check it guards
+    // itself with — on Windows, `bind_support_for` reports `Unsupported`,
+    // which is exactly what makes `new_bound` refuse before touching
+    // `Session::new_with_opts`.
+    #[test]
+    fn windows_is_unsupported_so_new_bound_refuses_there() {
+        use crate::vpn::policy::{bind_support_for, BindSupport};
+        assert_eq!(bind_support_for("windows"), BindSupport::Unsupported);
     }
 }
