@@ -66,7 +66,12 @@ impl DownloadQueue {
     /// Adding a torrent already in the queue is a no-op that returns the
     /// existing infohash: a user pressing the key twice must not start a
     /// second copy.
-    pub async fn add(&self, magnet: &str, title: &str) -> Result<String, EngineError> {
+    pub async fn add(
+        &self,
+        magnet: &str,
+        title: &str,
+        paused: bool,
+    ) -> Result<String, EngineError> {
         let _guard = self.add_lock.lock().await;
 
         if let Some(existing) = self
@@ -80,7 +85,7 @@ impl DownloadQueue {
 
         let infohash = self
             .engine
-            .add_magnet(magnet, &self.download_dir, false)
+            .add_magnet(magnet, &self.download_dir, paused)
             .await?;
 
         let mut entries = self.lock();
@@ -92,7 +97,7 @@ impl DownloadQueue {
             magnet: magnet.to_string(),
             title: title.to_string(),
             added_unix: now_unix(),
-            paused: false,
+            paused,
         });
         Ok(infohash)
     }
@@ -154,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn add_registers_an_entry_and_starts_the_torrent() {
         let (engine, queue) = queue();
-        let hash = queue.add(MAGNET_A, "Movie A").await.unwrap();
+        let hash = queue.add(MAGNET_A, "Movie A", false).await.unwrap();
         assert_eq!(hash, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
         let entries = queue.entries();
@@ -169,8 +174,8 @@ mod tests {
     #[tokio::test]
     async fn adding_the_same_torrent_twice_is_idempotent() {
         let (engine, queue) = queue();
-        let first = queue.add(MAGNET_A, "Movie A").await.unwrap();
-        let second = queue.add(MAGNET_A, "Movie A again").await.unwrap();
+        let first = queue.add(MAGNET_A, "Movie A", false).await.unwrap();
+        let second = queue.add(MAGNET_A, "Movie A again", false).await.unwrap();
         assert_eq!(first, second);
         assert_eq!(queue.entries().len(), 1);
         assert_eq!(
@@ -181,9 +186,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adding_paused_starts_the_torrent_pre_paused() {
+        let (engine, queue) = queue();
+        let hash = queue.add(MAGNET_A, "A", true).await.unwrap();
+
+        assert!(
+            queue.entries()[0].paused,
+            "entry must record the paused intent"
+        );
+        assert_eq!(
+            engine.snapshot(&hash).await.unwrap().state,
+            TorrentState::Paused,
+            "engine must have been told paused at add time, not corrected afterwards"
+        );
+    }
+
+    #[tokio::test]
     async fn pause_and_resume_update_entry_and_engine() {
         let (engine, queue) = queue();
-        let hash = queue.add(MAGNET_A, "A").await.unwrap();
+        let hash = queue.add(MAGNET_A, "A", false).await.unwrap();
 
         queue.pause(&hash).await.unwrap();
         assert!(queue.entries()[0].paused);
@@ -203,7 +224,7 @@ mod tests {
     #[tokio::test]
     async fn remove_drops_the_entry() {
         let (engine, queue) = queue();
-        let hash = queue.add(MAGNET_A, "A").await.unwrap();
+        let hash = queue.add(MAGNET_A, "A", false).await.unwrap();
         queue.remove(&hash, false).await.unwrap();
         assert!(queue.entries().is_empty());
         assert!(engine.snapshots().await.is_empty());
@@ -212,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn remove_succeeds_even_if_the_engine_forgot_the_torrent() {
         let (engine, queue) = queue();
-        let hash = queue.add(MAGNET_A, "A").await.unwrap();
+        let hash = queue.add(MAGNET_A, "A", false).await.unwrap();
         engine.remove(&hash, false).await.unwrap(); // engine loses it behind the queue's back
         queue.remove(&hash, false).await.unwrap();
         assert!(queue.entries().is_empty());
@@ -222,7 +243,7 @@ mod tests {
     async fn a_failed_add_leaves_no_entry_behind() {
         let (engine, queue) = queue();
         engine.fail_next_add("backend exploded");
-        let err = queue.add(MAGNET_A, "A").await.unwrap_err();
+        let err = queue.add(MAGNET_A, "A", false).await.unwrap_err();
         assert!(matches!(err, EngineError::Backend(_)));
         assert!(
             queue.entries().is_empty(),
@@ -251,8 +272,8 @@ mod tests {
     #[tokio::test]
     async fn snapshots_covers_every_live_torrent() {
         let (_engine, queue) = queue();
-        queue.add(MAGNET_A, "A").await.unwrap();
-        queue.add(MAGNET_B, "B").await.unwrap();
+        queue.add(MAGNET_A, "A", false).await.unwrap();
+        queue.add(MAGNET_B, "B", false).await.unwrap();
         assert_eq!(queue.snapshots().await.len(), 2);
     }
 
@@ -267,7 +288,10 @@ mod tests {
         let q1 = queue.clone();
         let q2 = queue.clone();
 
-        let (r1, r2) = tokio::join!(q1.add(MAGNET_A, "A first"), q2.add(MAGNET_A, "A second"));
+        let (r1, r2) = tokio::join!(
+            q1.add(MAGNET_A, "A first", false),
+            q2.add(MAGNET_A, "A second", false)
+        );
 
         let hash1 = r1.unwrap();
         let hash2 = r2.unwrap();

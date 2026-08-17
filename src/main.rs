@@ -96,10 +96,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let (queue, state_path) = open_queue().await?;
             let title = title.unwrap_or_else(|| magnet.clone());
-            let infohash = queue.add(&magnet, &title).await?;
-            if paused {
-                queue.pause(&infohash).await?;
-            }
+            let infohash = queue.add(&magnet, &title, paused).await?;
             queue.save(&state_path)?;
             println!("added {infohash}");
         }
