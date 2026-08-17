@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::engine::{EngineError, TorrentEngine, TorrentSnapshot};
 
@@ -22,6 +23,7 @@ pub struct DownloadQueue {
     engine: Arc<dyn TorrentEngine>,
     download_dir: PathBuf,
     entries: Mutex<Vec<QueueEntry>>,
+    add_lock: AsyncMutex<()>,
 }
 
 fn now_unix() -> u64 {
@@ -45,6 +47,7 @@ impl DownloadQueue {
             engine,
             download_dir,
             entries: Mutex::new(entries),
+            add_lock: AsyncMutex::new(()),
         }
     }
 
@@ -64,6 +67,8 @@ impl DownloadQueue {
     /// existing infohash: a user pressing the key twice must not start a
     /// second copy.
     pub async fn add(&self, magnet: &str, title: &str) -> Result<String, EngineError> {
+        let _guard = self.add_lock.lock().await;
+
         if let Some(existing) = self
             .lock()
             .iter()
@@ -243,5 +248,34 @@ mod tests {
         queue.add(MAGNET_A, "A").await.unwrap();
         queue.add(MAGNET_B, "B").await.unwrap();
         assert_eq!(queue.snapshots().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_adds_of_same_magnet_are_serialized() {
+        let engine = Arc::new(FakeEngine::new());
+        let queue = Arc::new(DownloadQueue::new(
+            engine.clone(),
+            PathBuf::from("/downloads"),
+        ));
+
+        let q1 = queue.clone();
+        let q2 = queue.clone();
+
+        let (r1, r2) = tokio::join!(q1.add(MAGNET_A, "A first"), q2.add(MAGNET_A, "A second"));
+
+        let hash1 = r1.unwrap();
+        let hash2 = r2.unwrap();
+
+        assert_eq!(hash1, hash2, "both calls should return the same infohash");
+        assert_eq!(
+            engine.added_magnets().len(),
+            1,
+            "engine.add_magnet must be called exactly once"
+        );
+        assert_eq!(
+            queue.entries().len(),
+            1,
+            "queue must have exactly one entry"
+        );
     }
 }
