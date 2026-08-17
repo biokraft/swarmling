@@ -39,18 +39,48 @@ impl LibrqbitEngine {
     /// pick torrents back up. Without `persistence` set, `fastresume: true` is
     /// a no-op: there is no session state file to resume from.
     pub async fn new(download_dir: PathBuf, session_dir: PathBuf) -> Result<Self, EngineError> {
-        let opts = SessionOptions {
+        let opts = Self::session_options(session_dir);
+        let session = Session::new_with_opts(download_dir, opts)
+            .await
+            .map_err(backend)?;
+        Ok(Self { session })
+    }
+
+    /// Build a session bound to `device`, so DHT, peer traffic, trackers and
+    /// local discovery are all pinned to the VPN interface.
+    ///
+    /// Only call this where `vpn::policy::bind_support()` reports `Supported`:
+    /// on Windows the underlying bind is unimplemented and session
+    /// construction fails outright.
+    pub async fn new_bound(
+        download_dir: PathBuf,
+        session_dir: PathBuf,
+        device: &str,
+    ) -> Result<Self, EngineError> {
+        let mut opts = Self::session_options(session_dir);
+        opts.bind_device_name = Some(device.to_string());
+        let session = Session::new_with_opts(download_dir, opts)
+            .await
+            .map_err(backend)?;
+        Ok(Self { session })
+    }
+
+    /// Shared `SessionOptions` for both constructors so persistence and
+    /// output-folder behaviour cannot drift between them. `download_dir`
+    /// (passed separately to `Session::new_with_opts`) is librqbit's default
+    /// OUTPUT folder; `session_dir` here is where librqbit persists its own
+    /// session state (resume data, torrent list) as JSON so a restart can
+    /// pick torrents back up. Without `persistence` set, `fastresume: true`
+    /// is a no-op: there is no session state file to resume from.
+    fn session_options(session_dir: PathBuf) -> SessionOptions {
+        SessionOptions {
             fastresume: true,
             persistence: Some(SessionPersistenceConfig::Json {
                 folder: Some(session_dir),
             }),
             client_name_and_version: Some(format!("swarmling {}", env!("CARGO_PKG_VERSION"))),
             ..Default::default()
-        };
-        let session = Session::new_with_opts(download_dir, opts)
-            .await
-            .map_err(backend)?;
-        Ok(Self { session })
+        }
     }
 
     fn handle(&self, infohash: &str) -> Result<Arc<ManagedTorrent>, EngineError> {
