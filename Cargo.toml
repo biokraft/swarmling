@@ -33,6 +33,7 @@ async-trait = "0.1"
 regex = "1"
 directories = "5"
 librqbit = "9"
+if-addrs = "0.13"
 
 [dev-dependencies]
 wiremock = "0.6"
