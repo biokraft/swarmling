@@ -1231,6 +1231,7 @@ dependencies = [
  "clap",
  "futures",
  "predicates",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
