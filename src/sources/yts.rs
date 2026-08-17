@@ -57,7 +57,7 @@ impl Source for Yts {
     }
     async fn search(&self, query: &str) -> Result<Vec<SearchResult>, SourceError> {
         let url = format!("{}/api/v2/list_movies.json", self.base_url);
-        let env: Envelope = reqwest::Client::new()
+        let env: Envelope = crate::util::net::client()
             .get(url)
             .query(&[("query_term", query)])
             .send()

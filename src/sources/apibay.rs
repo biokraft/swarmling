@@ -36,7 +36,7 @@ impl Apibay {
 
     async fn fetch(&self, query: &str) -> Result<Vec<Row>, SourceError> {
         let url = format!("{}/q.php", self.base_url);
-        let rows: Vec<Row> = reqwest::Client::new()
+        let rows: Vec<Row> = crate::util::net::client()
             .get(url)
             .query(&[("q", query)])
             .send()
