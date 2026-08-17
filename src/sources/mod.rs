@@ -5,6 +5,7 @@ pub mod magnet;
 pub mod nyaa;
 pub mod registry;
 pub mod rss;
+pub mod subsplease;
 pub mod types;
 pub mod yts;
 pub use types::{
