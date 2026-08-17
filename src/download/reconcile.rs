@@ -26,8 +26,14 @@ pub async fn restore(
             .add_magnet(&entry.magnet, &download_dir, entry.paused)
             .await
         {
-            Ok(_) => {
+            Ok(returned_infohash) => {
                 report.restored += 1;
+                let mut entry = entry;
+                // The engine's returned hash is authoritative: if it ever
+                // differs from what was persisted, keep the entry matchable
+                // against future engine calls rather than stranding it under
+                // a stale hash.
+                entry.infohash = returned_infohash;
                 kept.push(entry);
             }
             Err(e) => report.failed.push((entry.infohash.clone(), e.to_string())),
@@ -112,6 +118,24 @@ mod tests {
             "the failed entry is dropped from the queue"
         );
         assert_eq!(queue.entries()[0].infohash, HASH_B);
+    }
+
+    #[tokio::test]
+    async fn restore_adopts_the_engines_returned_infohash() {
+        let engine = Arc::new(FakeEngine::new());
+        // Persisted entry has a stale infohash that doesn't match the magnet
+        // it was built from; the engine derives the real one from the magnet.
+        let mut stale = entry(HASH_A, false);
+        stale.infohash = "cccccccccccccccccccccccccccccccccccccccc".into();
+
+        let (queue, report) = restore(engine.clone(), PathBuf::from("/d"), vec![stale]).await;
+
+        assert_eq!(report.restored, 1);
+        assert_eq!(
+            queue.entries()[0].infohash,
+            HASH_A,
+            "kept entry must adopt the engine's returned infohash"
+        );
     }
 
     #[tokio::test]
