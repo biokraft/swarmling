@@ -1,4 +1,5 @@
 use super::apibay::Apibay;
+use super::bittorrented::Bittorrented;
 use super::eztv::Eztv;
 use super::fitgirl::Fitgirl;
 use super::nyaa::Nyaa;
@@ -15,5 +16,6 @@ pub fn all_sources() -> Vec<Box<dyn Source>> {
         Box::new(Nyaa::new()),
         Box::new(Eztv::new()),
         Box::new(Subsplease::new()),
+        Box::new(Bittorrented::new()),
     ]
 }
