@@ -14,15 +14,23 @@ pub trait InterfaceProvider: Send + Sync {
 /// Device-name prefixes that indicate a tunnel. Provider-specific names come
 /// first: when several tunnels are up, a device we can attribute to a known
 /// VPN is a better guess than a generic one.
-pub const VPN_PREFIXES: &[&str] = &[
-    "nordlynx", "proton", "tun", "tap", "wg", "utun", "ppp", "ipsec",
-];
+pub const VPN_PREFIXES: &[&str] = &["nordlynx", "proton", "tun", "tap", "wg", "utun", "ipsec"];
 
 const PROVIDER_PREFIXES: &[&str] = &["nordlynx", "proton"];
+
+/// Prefixes that start with a VPN indicator but are NOT actually VPNs.
+/// This escape hatch handles known collisions where a name-based heuristic
+/// would produce a false positive: e.g. `tunl0` is a Linux IPIP tunnel for
+/// container networking (Flannel, kube-proxy), not a VPN.
+const NOT_VPN_PREFIXES: &[&str] = &["tunl"];
 
 pub fn is_vpn_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     if name == "lo" || name.starts_with("lo0") {
+        return false;
+    }
+    // Exclude known false positives before checking VPN prefixes.
+    if NOT_VPN_PREFIXES.iter().any(|p| name.starts_with(p)) {
         return false;
     }
     VPN_PREFIXES.iter().any(|p| name.starts_with(p))
@@ -39,6 +47,12 @@ fn is_provider_name(name: &str) -> bool {
 /// macOS uses `utun` for unrelated things such as iCloud Private Relay. A
 /// provider adapter that can answer authoritatively should be preferred over
 /// this function.
+///
+/// The heuristic errs toward NOT detecting a VPN. A false positive would
+/// claim protection swarmling is not actually providing — a critical safety
+/// issue — so an interface is only returned when the heuristic is relatively
+/// confident. No real interface name or IP from the system is used; all tests
+/// employ synthetic data.
 pub fn detect_vpn(provider: &dyn InterfaceProvider) -> Option<Interface> {
     let all = provider.interfaces();
     all.iter()
@@ -103,7 +117,7 @@ mod tests {
     #[test]
     fn recognises_tunnel_device_names() {
         for name in [
-            "tun0", "tap0", "wg0", "utun3", "ppp0", "ipsec1", "nordlynx", "proton0",
+            "tun0", "tap0", "wg0", "utun3", "ipsec1", "nordlynx", "proton0",
         ] {
             assert!(is_vpn_name(name), "{name} should count as a tunnel");
         }
@@ -159,5 +173,39 @@ mod tests {
         assert!(detect_vpn(&p).is_none());
         p.set(vec![iface("en0", 2), iface("wg0", 5)]);
         assert_eq!(detect_vpn(&p).unwrap().name, "wg0");
+    }
+
+    #[test]
+    fn rejects_ppp0_which_is_often_a_dsl_connection() {
+        assert!(!is_vpn_name("ppp0"), "ppp0 must not count as a VPN");
+    }
+
+    #[test]
+    fn rejects_pppoe_wan_which_is_often_a_dsl_connection() {
+        assert!(
+            !is_vpn_name("pppoe-wan"),
+            "pppoe-wan must not count as a VPN"
+        );
+    }
+
+    #[test]
+    fn rejects_tunl0_which_is_a_container_tunnel() {
+        assert!(!is_vpn_name("tunl0"), "tunl0 must not count as a VPN");
+    }
+
+    #[test]
+    fn confirms_real_vpn_prefixes_still_detected() {
+        for name in ["tun0", "wg0", "utun3", "ipsec0", "nordlynx"] {
+            assert!(
+                is_vpn_name(name),
+                "{name} should still be detected as a VPN"
+            );
+        }
+    }
+
+    #[test]
+    fn returns_none_when_only_dsl_is_available() {
+        let p = FakeInterfaces::new(vec![iface("ppp0", 1), iface("en0", 2)]);
+        assert!(detect_vpn(&p).is_none());
     }
 }
