@@ -1,6 +1,7 @@
 pub mod apibay;
 pub mod fitgirl;
 pub mod magnet;
+pub mod nyaa;
 pub mod registry;
 pub mod rss;
 pub mod types;
