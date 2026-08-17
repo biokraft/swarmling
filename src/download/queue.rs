@@ -250,7 +250,7 @@ mod tests {
         assert_eq!(queue.snapshots().await.len(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_adds_of_same_magnet_are_serialized() {
         let engine = Arc::new(FakeEngine::new());
         let queue = Arc::new(DownloadQueue::new(

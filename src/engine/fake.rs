@@ -61,6 +61,9 @@ impl TorrentEngine for FakeEngine {
         _output_dir: &Path,
         paused: bool,
     ) -> Result<InfoHash, EngineError> {
+        // Yield to allow other tasks to run; a real engine would await here.
+        tokio::task::yield_now().await;
+
         let parsed =
             parse_magnet(magnet).ok_or_else(|| EngineError::InvalidMagnet(magnet.to_string()))?;
         let mut inner = self.lock();
