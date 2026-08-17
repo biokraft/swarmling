@@ -128,6 +128,12 @@ impl DownloadQueue {
     pub async fn snapshots(&self) -> Vec<TorrentSnapshot> {
         self.engine.snapshots().await
     }
+
+    /// Persist the current entries. Callers save after any mutation; the queue
+    /// deliberately does not save itself, so tests never touch the filesystem.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        super::persist::save_entries(path, &self.entries())
+    }
 }
 
 #[cfg(test)]
