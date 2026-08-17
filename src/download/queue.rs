@@ -102,6 +102,7 @@ impl DownloadQueue {
         Ok(infohash)
     }
 
+    /// Persisting is the caller's responsibility: call `save` afterwards.
     pub async fn pause(&self, infohash: &str) -> Result<(), EngineError> {
         self.engine.pause(infohash).await?;
         if let Some(e) = self.lock().iter_mut().find(|e| e.infohash == infohash) {
@@ -110,6 +111,7 @@ impl DownloadQueue {
         Ok(())
     }
 
+    /// Persisting is the caller's responsibility: call `save` afterwards.
     pub async fn resume(&self, infohash: &str) -> Result<(), EngineError> {
         self.engine.resume(infohash).await?;
         if let Some(e) = self.lock().iter_mut().find(|e| e.infohash == infohash) {
