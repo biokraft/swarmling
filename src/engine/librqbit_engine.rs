@@ -51,14 +51,21 @@ fn to_snapshot(handle: &Arc<ManagedTorrent>) -> TorrentSnapshot {
         TorrentState::Errored
     } else if handle.is_paused() {
         TorrentState::Paused
+    } else if matches!(stats.state, librqbit::TorrentStatsState::Initializing { .. }) {
+        // While librqbit reports Initializing it is still verifying on-disk
+        // data, so labelling it "Seeding" would claim more than we actually
+        // know. "Checking" is the honest label until verification completes,
+        // which is also why this check must come before the `finished` one.
+        TorrentState::Checking
     } else if stats.finished {
         TorrentState::Seeding
     } else {
         TorrentState::Downloading
     };
-    // LiveStats::download_speed/upload_speed are `Speed` (megabits-per-second
-    // internally) with an `as_bytes()` helper that yields bytes/sec directly,
-    // so we don't need to fall back to a 0 placeholder here.
+    // LiveStats::download_speed/upload_speed are `Speed` (MiB/s internally —
+    // librqbit's own Display renders it as "{:.2} MiB/s") with an
+    // `as_bytes()` helper that converts to bytes/sec directly, so we don't
+    // need to fall back to a 0 placeholder here.
     let (download_speed, upload_speed) = stats
         .live
         .as_ref()
