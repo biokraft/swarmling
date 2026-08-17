@@ -1,6 +1,8 @@
 pub mod apibay;
+pub mod fitgirl;
 pub mod magnet;
 pub mod registry;
+pub mod rss;
 pub mod types;
 pub mod yts;
 pub use types::{
