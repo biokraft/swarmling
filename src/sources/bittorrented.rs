@@ -1,5 +1,6 @@
 use serde::Deserialize;
 
+use super::magnet::is_infohash;
 use super::{build_magnet, SearchResult, Source, SourceError, SourceGroup};
 
 /// The API rejects anything shorter, so an empty browse returns nothing
@@ -44,10 +45,6 @@ impl Default for Bittorrented {
     }
 }
 
-fn is_infohash(s: &str) -> bool {
-    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 #[async_trait::async_trait]
 impl Source for Bittorrented {
     fn id(&self) -> &'static str {
@@ -85,9 +82,15 @@ impl Source for Bittorrented {
             if !is_infohash(&infohash) {
                 continue;
             }
-            let title = row.torrent_name.unwrap_or_else(|| infohash.clone());
+            let title = row
+                .torrent_name
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| infohash.clone());
+            let Some(magnet) = build_magnet(&infohash, &title, &[]) else {
+                continue;
+            };
             out.push(SearchResult {
-                magnet: build_magnet(&infohash, &title, &[]),
+                magnet,
                 title,
                 size_bytes: row.torrent_total_size.unwrap_or(0),
                 seeders: row.torrent_seeders.unwrap_or(0),

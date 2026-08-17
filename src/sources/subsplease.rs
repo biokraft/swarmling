@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use serde::Deserialize;
 
 use super::magnet::parse_magnet;
@@ -85,13 +83,19 @@ impl Source for Subsplease {
 
         // A JSON array (rather than the usual keyed object) is how the API says
         // "nothing found"; deserializing it as a map would be an error, not an
-        // empty result.
-        let Ok(entries) = serde_json::from_value::<HashMap<String, Entry>>(body) else {
+        // empty result. `serde_json::Map` (with the `preserve_order` feature)
+        // keeps insertion order, so identical responses always yield the same
+        // result order instead of HashMap's randomized-per-process iteration.
+        let Some(entries) = body.as_object() else {
             return Ok(vec![]);
         };
 
         let mut out = Vec::new();
-        for entry in entries.values() {
+        for value in entries.values() {
+            let Ok(entry) = serde_json::from_value::<Entry>(value.clone()) else {
+                continue;
+            };
+            let entry = &entry;
             let Some(download) = pick_best(&entry.downloads) else {
                 continue;
             };
@@ -109,8 +113,11 @@ impl Source for Subsplease {
                 .unwrap_or_default();
             let res = download.res.as_deref().unwrap_or("?");
             let title = format!("{show}{episode} [{res}p]");
+            let Some(magnet) = build_magnet(&parsed.infohash, &title, &parsed.trackers) else {
+                continue;
+            };
             out.push(SearchResult {
-                magnet: build_magnet(&parsed.infohash, &title, &parsed.trackers),
+                magnet,
                 title,
                 size_bytes: exact_length(raw),
                 seeders: 0,
@@ -159,6 +166,50 @@ mod tests {
         assert_eq!(out[0].size_bytes, 1_500_000_000);
         assert_eq!(out[0].seeders, 0);
         assert_eq!(out[0].source_id, "subsplease");
+    }
+
+    #[tokio::test]
+    async fn preserves_a_stable_order_across_repeated_calls() {
+        let body = serde_json::json!({
+            "aaa": {"show": "Alpha Show", "episode": "01", "downloads": [
+                {"res": "1080", "magnet": "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"}
+            ]},
+            "bbb": {"show": "Bravo Show", "episode": "01", "downloads": [
+                {"res": "1080", "magnet": "magnet:?xt=urn:btih:2222222222222222222222222222222222222222"}
+            ]},
+            "ccc": {"show": "Charlie Show", "episode": "01", "downloads": [
+                {"res": "1080", "magnet": "magnet:?xt=urn:btih:3333333333333333333333333333333333333333"}
+            ]},
+            "ddd": {"show": "Delta Show", "episode": "01", "downloads": [
+                {"res": "1080", "magnet": "magnet:?xt=urn:btih:4444444444444444444444444444444444444444"}
+            ]},
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/"))
+            .and(query_param("f", "search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let mut src = Subsplease::new();
+        src.base_url = server.uri();
+
+        let first = src.search("show").await.unwrap();
+        let expected: Vec<String> = first.iter().map(|r| r.title.clone()).collect();
+        assert_eq!(
+            expected,
+            vec![
+                "Alpha Show - 01 [1080p]",
+                "Bravo Show - 01 [1080p]",
+                "Charlie Show - 01 [1080p]",
+                "Delta Show - 01 [1080p]",
+            ]
+        );
+        for _ in 0..5 {
+            let out = src.search("show").await.unwrap();
+            let titles: Vec<String> = out.iter().map(|r| r.title.clone()).collect();
+            assert_eq!(titles, expected);
+        }
     }
 
     #[tokio::test]

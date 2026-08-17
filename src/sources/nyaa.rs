@@ -1,5 +1,5 @@
 use super::{build_magnet, SearchResult, Source, SourceError, SourceGroup};
-use crate::util::format::{parse_size, unescape_entities};
+use crate::util::format::{parse_size, tag, unescape_entities};
 
 pub struct Nyaa {
     pub base_url: String,
@@ -17,27 +17,6 @@ impl Default for Nyaa {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Pull one tag's text out of a single `<item>` block, unwrapping CDATA.
-/// Hand-rolled rather than a full XML parse: the feed is flat and this keeps
-/// a malformed row from failing the whole search.
-fn tag(item: &str, name: &str) -> String {
-    let open = format!("<{name}>");
-    let close = format!("</{name}>");
-    let Some(start) = item.find(&open) else {
-        return String::new();
-    };
-    let rest = &item[start + open.len()..];
-    let Some(end) = rest.find(&close) else {
-        return String::new();
-    };
-    rest[..end]
-        .trim()
-        .trim_start_matches("<![CDATA[")
-        .trim_end_matches("]]>")
-        .trim()
-        .to_string()
 }
 
 #[async_trait::async_trait]
@@ -70,8 +49,11 @@ impl Source for Nyaa {
             if infohash.is_empty() || title.is_empty() {
                 continue;
             }
+            let Some(magnet) = build_magnet(&infohash, &title, &[]) else {
+                continue;
+            };
             out.push(SearchResult {
-                magnet: build_magnet(&infohash, &title, &[]),
+                magnet,
                 title,
                 size_bytes: parse_size(&tag(item, "nyaa:size")),
                 seeders: tag(item, "nyaa:seeders").parse().unwrap_or(0),

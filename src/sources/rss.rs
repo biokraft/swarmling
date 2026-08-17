@@ -4,13 +4,11 @@ use regex::Regex;
 
 use super::magnet::parse_magnet;
 use super::{build_magnet, SearchResult, SourceError};
-use crate::util::format::unescape_entities;
+use crate::util::format::{tag, unescape_entities};
 
 static MAGNET_HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)href="(magnet:\?xt=urn:btih:[^"]+)""#).expect("magnet href regex is valid")
 });
-static TITLE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)<title>(.*?)</title>").expect("title regex is valid"));
 
 /// WordPress-style feeds carry a magnet link and a title and nothing else:
 /// no swarm counts, no sizes. Rows without a magnet are dropped.
@@ -24,12 +22,17 @@ pub fn parse_rss_items(xml: &str, source_id: &'static str) -> Vec<SearchResult> 
         let Some(parsed) = parse_magnet(&raw) else {
             continue;
         };
-        let title = TITLE_RE
-            .captures(item)
-            .map(|c| unescape_entities(c[1].trim()))
-            .unwrap_or_else(|| "Unknown Title".to_string());
+        let raw_title = tag(item, "title");
+        let title = if raw_title.is_empty() {
+            "Unknown Title".to_string()
+        } else {
+            unescape_entities(&raw_title)
+        };
+        let Some(magnet) = build_magnet(&parsed.infohash, &title, &parsed.trackers) else {
+            continue;
+        };
         out.push(SearchResult {
-            magnet: build_magnet(&parsed.infohash, &title, &parsed.trackers),
+            magnet,
             title,
             size_bytes: 0,
             seeders: 0,
@@ -88,5 +91,19 @@ mod tests {
     #[test]
     fn empty_feed_yields_no_results() {
         assert!(parse_rss_items("<rss><channel></channel></rss>", "fitgirl").is_empty());
+    }
+
+    #[test]
+    fn cdata_wrapped_title_loses_the_wrapper() {
+        let feed = r#"<rss><channel>
+          <item>
+            <title><![CDATA[Some Game - Repack]]></title>
+            <description>&lt;a href="magnet:?xt=urn:btih:ABCDEF1234567890ABCDEF1234567890ABCDEF12"&gt;magnet&lt;/a&gt;</description>
+          </item>
+        </channel></rss>"#;
+        let out = parse_rss_items(feed, "fitgirl");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Some Game - Repack");
+        assert!(!out[0].title.contains("CDATA"));
     }
 }

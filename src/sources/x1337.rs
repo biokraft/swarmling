@@ -190,8 +190,9 @@ impl Source for X1337 {
                 let html = Self::fetch_text(url).await.ok()?;
                 let raw = unescape_entities(MAGNET_RE.find(&html)?.as_str());
                 let parsed = parse_magnet(&raw)?;
+                let magnet = build_magnet(&parsed.infohash, &row.name, &parsed.trackers)?;
                 Some(SearchResult {
-                    magnet: build_magnet(&parsed.infohash, &row.name, &parsed.trackers),
+                    magnet,
                     title: row.name,
                     size_bytes: row.size_bytes,
                     seeders: row.seeders,

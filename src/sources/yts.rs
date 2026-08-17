@@ -73,13 +73,16 @@ impl Source for Yts {
                 let title = m.title_long;
                 m.torrents
                     .into_iter()
-                    .map(move |t| SearchResult {
-                        title: format!("{title} [{}]", t.quality),
-                        magnet: magnet_from_infohash(&t.hash, &title),
-                        size_bytes: t.size_bytes,
-                        seeders: t.seeds,
-                        leechers: t.peers,
-                        source_id: "yts",
+                    .filter_map(move |t| {
+                        let magnet = magnet_from_infohash(&t.hash, &title)?;
+                        Some(SearchResult {
+                            title: format!("{title} [{}]", t.quality),
+                            magnet,
+                            size_bytes: t.size_bytes,
+                            seeders: t.seeds,
+                            leechers: t.peers,
+                            source_id: "yts",
+                        })
                     })
                     .collect::<Vec<_>>()
             })

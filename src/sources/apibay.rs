@@ -71,13 +71,16 @@ impl Source for Apibay {
         }
         Ok(rows
             .into_iter()
-            .map(|r| SearchResult {
-                magnet: magnet_from_infohash(&r.info_hash, &r.name),
-                title: r.name,
-                size_bytes: r.size.parse().unwrap_or(0),
-                seeders: r.seeders.parse().unwrap_or(0),
-                leechers: r.leechers.parse().unwrap_or(0),
-                source_id: self.id,
+            .filter_map(|r| {
+                let magnet = magnet_from_infohash(&r.info_hash, &r.name)?;
+                Some(SearchResult {
+                    magnet,
+                    title: r.name,
+                    size_bytes: r.size.parse().unwrap_or(0),
+                    seeders: r.seeders.parse().unwrap_or(0),
+                    leechers: r.leechers.parse().unwrap_or(0),
+                    source_id: self.id,
+                })
             })
             .collect())
     }

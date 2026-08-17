@@ -67,9 +67,15 @@ fn params<'a>(raw: &'a str, key: &str) -> Vec<&'a str> {
     query
         .split('&')
         .filter_map(|pair| pair.split_once('='))
-        .filter(|(k, _)| *k == key)
+        .filter(|(k, _)| k.eq_ignore_ascii_case(key))
         .map(|(_, v)| v)
         .collect()
+}
+
+/// Whether `s` is a well-formed 40-char hex BitTorrent infohash. The single
+/// gate every caller must pass before an infohash reaches a built magnet.
+pub fn is_infohash(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Returns None when the input carries no usable infohash — the caller drops
@@ -128,5 +134,24 @@ mod tests {
             normalize_infohash("ABCDEF1234567890ABCDEF1234567890ABCDEF12"),
             "abcdef1234567890abcdef1234567890abcdef12"
         );
+    }
+
+    #[test]
+    fn params_matches_keys_case_insensitively() {
+        let raw = "magnet:?XT=urn:btih:ABCDEF1234567890ABCDEF1234567890ABCDEF12\
+                   &DN=Upper+Case&TR=udp%3A%2F%2Ftracker.example%3A80%2Fannounce";
+        let p = parse_magnet(raw).unwrap();
+        assert_eq!(p.name, "Upper Case");
+        assert_eq!(
+            p.trackers,
+            vec!["udp://tracker.example:80/announce".to_string()]
+        );
+    }
+
+    #[test]
+    fn is_infohash_requires_forty_hex_chars() {
+        assert!(is_infohash("abcdef1234567890abcdef1234567890abcdef12"));
+        assert!(!is_infohash("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
+        assert!(!is_infohash("abcdef"));
     }
 }

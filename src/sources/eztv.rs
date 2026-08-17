@@ -1,5 +1,6 @@
 use serde::Deserialize;
 
+use super::magnet::parse_magnet;
 use super::{build_magnet, SearchResult, Source, SourceError, SourceGroup};
 
 #[derive(Deserialize)]
@@ -89,11 +90,23 @@ impl Source for Eztv {
             if hash.is_empty() {
                 continue;
             }
-            let title = t.title.or(t.filename).unwrap_or_else(|| hash.clone());
-            let magnet = t
+            let title = t
+                .title
+                .filter(|s| !s.is_empty())
+                .or_else(|| t.filename.filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| hash.clone());
+            // Keep the site's own trackers (if any were embedded in its magnet)
+            // and still add the shared defaults, matching every other source.
+            let extra_trackers = t
                 .magnet_url
+                .as_deref()
                 .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| build_magnet(&hash, &title, &[]));
+                .and_then(parse_magnet)
+                .map(|parsed| parsed.trackers)
+                .unwrap_or_default();
+            let Some(magnet) = build_magnet(&hash, &title, &extra_trackers) else {
+                continue;
+            };
             out.push(SearchResult {
                 title,
                 magnet,
@@ -146,5 +159,34 @@ mod tests {
         let mut src = Eztv::new();
         src.base_url = server.uri();
         assert!(src.search("breaking bad").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn keeps_the_sites_own_tracker_and_adds_the_defaults() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/get-torrents"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "torrents": [
+                    {"title": "Show S01E01", "hash": "ABCDEF1234567890ABCDEF1234567890ABCDEF12",
+                     "magnet_url": "magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12\
+                        &tr=udp%3A%2F%2Feztv.example%3A80%2Fannounce",
+                     "seeds": 12, "peers": 3, "size_bytes": "734003200"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let mut src = Eztv::new();
+        src.base_url = server.uri();
+        let out = src.search("").await.unwrap();
+        assert_eq!(out.len(), 1);
+        // the site's own tracker survives...
+        assert!(out[0]
+            .magnet
+            .contains("udp%3A%2F%2Feztv.example%3A80%2Fannounce"));
+        // ...and the shared defaults are still appended.
+        assert!(out[0]
+            .magnet
+            .contains("udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"));
     }
 }

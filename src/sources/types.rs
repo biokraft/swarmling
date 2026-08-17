@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 
+use super::magnet::is_infohash;
+
 pub enum SourceGroup {
     Games,
     Movies,
@@ -49,7 +51,7 @@ pub const DEFAULT_TRACKERS: &[&str] = &[
     "https://tracker.tamersunion.org:443/announce",
 ];
 
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -64,7 +66,15 @@ fn percent_encode(s: &str) -> String {
 
 /// `extra_trackers` come first and win on duplicates: a torrent that carries its
 /// own announce list means that list, and the public defaults are a fallback.
-pub fn build_magnet(infohash: &str, name: &str, extra_trackers: &[String]) -> String {
+///
+/// The single chokepoint that guarantees a well-formed magnet: an `infohash`
+/// that isn't 40 hex characters is rejected outright (`None`) rather than
+/// interpolated unescaped into the URI, so a hostile or malformed feed value
+/// can never inject extra `&tr=`/`&dn=` parameters or emit a broken magnet.
+pub fn build_magnet(infohash: &str, name: &str, extra_trackers: &[String]) -> Option<String> {
+    if !is_infohash(infohash) {
+        return None;
+    }
     let mut magnet = format!(
         "magnet:?xt=urn:btih:{}&dn={}",
         infohash.to_lowercase(),
@@ -82,10 +92,10 @@ pub fn build_magnet(infohash: &str, name: &str, extra_trackers: &[String]) -> St
         magnet.push_str("&tr=");
         magnet.push_str(&percent_encode(tracker));
     }
-    magnet
+    Some(magnet)
 }
 
-pub fn magnet_from_infohash(infohash: &str, name: &str) -> String {
+pub fn magnet_from_infohash(infohash: &str, name: &str) -> Option<String> {
     build_magnet(infohash, name, &[])
 }
 
@@ -95,7 +105,8 @@ mod tests {
 
     #[test]
     fn build_magnet_appends_default_trackers() {
-        let m = build_magnet("ABCDEF1234567890ABCDEF1234567890ABCDEF12", "Cool ISO", &[]);
+        let m = build_magnet("ABCDEF1234567890ABCDEF1234567890ABCDEF12", "Cool ISO", &[])
+            .expect("valid infohash builds a magnet");
         assert!(m.starts_with(
             "magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12&dn=Cool%20ISO"
         ));
@@ -109,7 +120,7 @@ mod tests {
             "udp://private.example:6969/announce".to_string(),
             "udp://tracker.opentrackr.org:1337/announce".to_string(),
         ];
-        let m = build_magnet("ABCDEF1234567890ABCDEF1234567890ABCDEF12", "X", &extra);
+        let m = build_magnet("ABCDEF1234567890ABCDEF1234567890ABCDEF12", "X", &extra).unwrap();
         let first_tr = m.find("&tr=").unwrap();
         assert!(m[first_tr..].starts_with("&tr=udp%3A%2F%2Fprivate.example%3A6969%2Fannounce"));
         // the duplicate of a default tracker must not appear twice
@@ -123,9 +134,24 @@ mod tests {
 
     #[test]
     fn magnet_from_infohash_still_builds_uri() {
-        let m = magnet_from_infohash("ABCDEF1234567890ABCDEF1234567890ABCDEF12", "Cool ISO");
+        let m =
+            magnet_from_infohash("ABCDEF1234567890ABCDEF1234567890ABCDEF12", "Cool ISO").unwrap();
         assert!(m.starts_with(
             "magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12&dn=Cool%20ISO"
         ));
+    }
+
+    #[test]
+    fn build_magnet_rejects_an_injection_shaped_infohash() {
+        // A hostile feed row's infohash field can't smuggle extra magnet params.
+        let hostile = "x&tr=udp://attacker.example/announce";
+        assert_eq!(build_magnet(hostile, "Name", &[]), None);
+    }
+
+    #[test]
+    fn build_magnet_rejects_forty_char_non_hex_string() {
+        let bogus = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        assert_eq!(bogus.len(), 40);
+        assert_eq!(build_magnet(bogus, "Name", &[]), None);
     }
 }

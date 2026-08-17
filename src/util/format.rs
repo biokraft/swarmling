@@ -28,6 +28,27 @@ pub fn parse_size(s: &str) -> u64 {
     (value * multiplier).round() as u64
 }
 
+/// Pull one tag's text out of an XML/RSS fragment, unwrapping CDATA. Hand-rolled
+/// rather than a full XML parse: feeds are flat and this keeps a malformed row
+/// from failing the whole search.
+pub fn tag(item: &str, name: &str) -> String {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let Some(start) = item.find(&open) else {
+        return String::new();
+    };
+    let rest = &item[start + open.len()..];
+    let Some(end) = rest.find(&close) else {
+        return String::new();
+    };
+    rest[..end]
+        .trim()
+        .trim_start_matches("<![CDATA[")
+        .trim_end_matches("]]>")
+        .trim()
+        .to_string()
+}
+
 /// Decode the handful of entities the feeds actually emit. Deliberately not a
 /// full HTML entity decoder: these are the ones upstream hit in practice.
 pub fn unescape_entities(s: &str) -> String {
@@ -65,6 +86,23 @@ mod tests {
         assert_eq!(parse_size("4.7 gib"), 5_046_586_573);
         assert_eq!(parse_size(""), 0);
         assert_eq!(parse_size("unknown"), 0);
+    }
+
+    #[test]
+    fn tag_unwraps_cdata_and_trims() {
+        let item = "<item><title><![CDATA[Some Show - 01]]></title></item>";
+        assert_eq!(tag(item, "title"), "Some Show - 01");
+    }
+
+    #[test]
+    fn tag_reads_plain_text_tags() {
+        let item = "<item><nyaa:seeders>42</nyaa:seeders></item>";
+        assert_eq!(tag(item, "nyaa:seeders"), "42");
+    }
+
+    #[test]
+    fn tag_is_empty_when_missing() {
+        assert_eq!(tag("<item></item>", "title"), "");
     }
 
     #[test]
