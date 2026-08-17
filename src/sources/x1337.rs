@@ -26,7 +26,7 @@ static LEECH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)class="coll-3 leeches[^"]*">\s*(\d+)"#).expect("leeches regex is valid")
 });
 static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)class="coll-4 size[^"]*">\s*([\d.]+\s*[KMGT]i?B)"#)
+    Regex::new(r#"(?i)class="coll-4 size[^"]*">\s*([\d.]+\s*[KMGT]?i?B)"#)
         .expect("size regex is valid")
 });
 static MAGNET_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -112,7 +112,8 @@ impl X1337 {
                 Category::Tv => "/popular-tv".to_string(),
             }
         } else {
-            format!("/category-search/{}/{cat}/1/", query.replace(' ', "+"))
+            let encoded = crate::sources::types::percent_encode(query).replace("%20", "+");
+            format!("/category-search/{encoded}/{cat}/1/")
         }
     }
 
@@ -224,6 +225,13 @@ mod tests {
     const DETAIL: &str = r#"<div><a href="magnet:?xt=urn:btih:ABCDEF1234567890ABCDEF1234567890ABCDEF12&amp;dn=Dune">Magnet</a></div>"#;
 
     #[test]
+    fn listing_path_percent_encodes_special_query_characters() {
+        let src = X1337::movies();
+        let path = src.listing_path("what? & why");
+        assert_eq!(path, "/category-search/what%3F+%26+why/Movies/1/");
+    }
+
+    #[test]
     fn parse_rows_reads_the_listing_table() {
         let rows = parse_rows(LISTING);
         assert_eq!(rows.len(), 2);
@@ -232,6 +240,18 @@ mod tests {
         assert_eq!(rows[0].seeders, 300);
         assert_eq!(rows[0].leechers, 20);
         assert_eq!(rows[0].size_bytes, 2_000_000_000);
+    }
+
+    #[test]
+    fn parse_rows_reads_bare_byte_sizes() {
+        let html = r#"<table class="table-list">
+          <tr><td class="coll-1 name"><a href="/torrent/333/Tiny/">Tiny File</a></td>
+              <td class="coll-2 seeds">1</td><td class="coll-3 leeches">0</td>
+              <td class="coll-4 size">512 B</td></tr>
+        </table>"#;
+        let rows = parse_rows(html);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].size_bytes, 512);
     }
 
     #[test]
