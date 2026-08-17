@@ -76,3 +76,26 @@ fn add_rejects_a_magnet_with_no_usable_infohash() {
         .assert()
         .failure();
 }
+
+#[test]
+fn help_lists_the_vpn_subcommand() {
+    let out = Command::cargo_bin("swarmling")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("vpn"),
+        "missing vpn subcommand in help:\n{stdout}"
+    );
+}
+
+#[test]
+fn vpn_require_rejects_a_bad_value() {
+    Command::cargo_bin("swarmling")
+        .unwrap()
+        .args(["vpn", "require", "maybe"])
+        .assert()
+        .failure();
+}

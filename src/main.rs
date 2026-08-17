@@ -29,6 +29,22 @@ enum Command {
         #[arg(long)]
         delete_files: bool,
     },
+    /// Inspect and configure the VPN guard
+    Vpn {
+        #[command(subcommand)]
+        action: VpnAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum VpnAction {
+    /// Show the VPN state and what protection this platform can give
+    Status,
+    /// Require a VPN before downloading
+    Require {
+        #[arg(value_parser = ["on", "off"])]
+        value: String,
+    },
 }
 
 fn human_size(bytes: u64) -> String {
@@ -174,6 +190,52 @@ async fn main() -> anyhow::Result<()> {
             save_entries(&state_path, &entries)?;
             println!("removed {infohash}");
         }
+        // `vpn status` only ever reads: it inspects interfaces and, for the
+        // nordvpn adapter, shells out to a read-only `nordvpn status`. It
+        // never calls `connect()` and never constructs a librqbit `Session`.
+        Command::Vpn { action } => match action {
+            VpnAction::Status => {
+                use std::sync::Arc;
+                use swarmling::config::{paths, settings};
+                use swarmling::util::command::SystemCommands;
+                use swarmling::vpn::adapter::{GenericAdapter, VpnAdapter, VpnStatus};
+                use swarmling::vpn::interfaces::SystemInterfaces;
+                use swarmling::vpn::nordvpn::NordVpnAdapter;
+                use swarmling::vpn::policy::protection_summary;
+
+                let cfg = settings::load(&paths::settings_path());
+                let provider = Arc::new(SystemInterfaces);
+                let adapter: Box<dyn VpnAdapter> = if cfg.vpn_adapter == "nordvpn" {
+                    Box::new(NordVpnAdapter::new(Arc::new(SystemCommands), provider))
+                } else {
+                    Box::new(GenericAdapter::new(provider))
+                };
+
+                println!("adapter: {}", adapter.name());
+                match adapter.status().await {
+                    VpnStatus::Connected { interface } => {
+                        println!("state: connected");
+                        println!("interface: {} ({})", interface.name, interface.ip);
+                    }
+                    VpnStatus::Disconnected => {
+                        println!("state: disconnected");
+                    }
+                    VpnStatus::Unknown(reason) => {
+                        println!("state: unknown ({reason})");
+                    }
+                }
+                println!("protection: {}", protection_summary(std::env::consts::OS));
+            }
+            VpnAction::Require { value } => {
+                use swarmling::config::{paths, settings};
+
+                let path = paths::settings_path();
+                let mut cfg = settings::load(&path);
+                cfg.vpn_required = value == "on";
+                settings::save(&path, &cfg)?;
+                println!("vpn_required: {}", cfg.vpn_required);
+            }
+        },
     }
     Ok(())
 }

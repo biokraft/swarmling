@@ -32,6 +32,10 @@ pub fn queue_state_path() -> PathBuf {
     data_dir().join("queue.json")
 }
 
+pub fn settings_path() -> PathBuf {
+    data_dir().join("settings.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
