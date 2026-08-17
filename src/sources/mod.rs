@@ -8,6 +8,7 @@ pub mod registry;
 pub mod rss;
 pub mod subsplease;
 pub mod types;
+pub mod x1337;
 pub mod yts;
 pub use types::{
     build_magnet, magnet_from_infohash, SearchResult, Source, SourceError, SourceGroup,
