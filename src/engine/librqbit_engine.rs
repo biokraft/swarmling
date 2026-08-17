@@ -2,15 +2,26 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use librqbit::api::TorrentIdOrHash;
-use librqbit::{AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions};
+use librqbit::{
+    AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions,
+    SessionPersistenceConfig,
+};
 
 use super::{EngineError, InfoHash, TorrentEngine, TorrentSnapshot, TorrentState};
+use crate::sources::magnet::is_infohash;
 
 fn backend<E: std::fmt::Display>(e: E) -> EngineError {
     EngineError::Backend(e.to_string())
 }
 
+/// Only a well-formed 40-char hex infohash is accepted here. Without this
+/// guard, `TorrentIdOrHash::parse` happily interprets a bare integer like
+/// "0" as a session INDEX rather than a hash, so a typo such as `rm 0` could
+/// resolve to an unrelated torrent that happens to sit at index 0.
 fn id_or_hash(infohash: &str) -> Result<TorrentIdOrHash, EngineError> {
+    if !is_infohash(infohash) {
+        return Err(EngineError::NotFound(infohash.to_string()));
+    }
     TorrentIdOrHash::try_from(infohash).map_err(|_| EngineError::NotFound(infohash.to_string()))
 }
 
@@ -22,13 +33,21 @@ pub struct LibrqbitEngine {
 }
 
 impl LibrqbitEngine {
-    pub async fn new(session_dir: PathBuf) -> Result<Self, EngineError> {
+    /// `download_dir` is where torrent data lands (librqbit's
+    /// `default_output_folder`); `session_dir` is where librqbit persists its
+    /// own session state (resume data, torrent list) as JSON so a restart can
+    /// pick torrents back up. Without `persistence` set, `fastresume: true` is
+    /// a no-op: there is no session state file to resume from.
+    pub async fn new(download_dir: PathBuf, session_dir: PathBuf) -> Result<Self, EngineError> {
         let opts = SessionOptions {
             fastresume: true,
+            persistence: Some(SessionPersistenceConfig::Json {
+                folder: Some(session_dir),
+            }),
             client_name_and_version: Some(format!("swarmling {}", env!("CARGO_PKG_VERSION"))),
             ..Default::default()
         };
-        let session = Session::new_with_opts(session_dir, opts)
+        let session = Session::new_with_opts(download_dir, opts)
             .await
             .map_err(backend)?;
         Ok(Self { session })
@@ -51,7 +70,10 @@ fn to_snapshot(handle: &Arc<ManagedTorrent>) -> TorrentSnapshot {
         TorrentState::Errored
     } else if handle.is_paused() {
         TorrentState::Paused
-    } else if matches!(stats.state, librqbit::TorrentStatsState::Initializing { .. }) {
+    } else if matches!(
+        stats.state,
+        librqbit::TorrentStatsState::Initializing { .. }
+    ) {
         // While librqbit reports Initializing it is still verifying on-disk
         // data, so labelling it "Seeding" would claim more than we actually
         // know. "Checking" is the honest label until verification completes,
@@ -118,7 +140,13 @@ impl TorrentEngine for LibrqbitEngine {
     }
 
     async fn remove(&self, infohash: &str, delete_files: bool) -> Result<(), EngineError> {
-        let id = id_or_hash(infohash)?;
+        // Look the handle up first so an infohash the session has already
+        // forgotten (or an invalid one) surfaces as `NotFound` rather than a
+        // generic `Backend` error from `session.delete` — `DownloadQueue::remove`
+        // only forgives `NotFound`, so mapping every delete failure to
+        // `Backend` would turn a forgotten torrent into a permanent orphan.
+        let handle = self.handle(infohash)?;
+        let id = TorrentIdOrHash::Hash(handle.info_hash());
         self.session.delete(id, delete_files).await.map_err(backend)
     }
 
@@ -129,5 +157,38 @@ impl TorrentEngine for LibrqbitEngine {
     async fn snapshots(&self) -> Vec<TorrentSnapshot> {
         self.session
             .with_torrents(|torrents| torrents.map(|(_, h)| to_snapshot(h)).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_or_hash_accepts_a_well_formed_infohash() {
+        let hash = "abcdef1234567890abcdef1234567890abcdef12";
+        let id = id_or_hash(hash).unwrap();
+        assert!(matches!(id, TorrentIdOrHash::Hash(_)));
+    }
+
+    #[test]
+    fn id_or_hash_rejects_a_bare_integer_index() {
+        // This is the exact footgun C2 guards against: librqbit's own parser
+        // treats a bare integer as a session index, so `rm 0` must never
+        // reach it.
+        let err = id_or_hash("0").unwrap_err();
+        assert!(matches!(err, EngineError::NotFound(_)));
+    }
+
+    #[test]
+    fn id_or_hash_rejects_garbage_and_wrong_length_strings() {
+        assert!(matches!(
+            id_or_hash("not-a-hash").unwrap_err(),
+            EngineError::NotFound(_)
+        ));
+        assert!(matches!(
+            id_or_hash("abcdef").unwrap_err(),
+            EngineError::NotFound(_)
+        ));
     }
 }
