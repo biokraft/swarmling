@@ -27,7 +27,8 @@ pub fn bind_support() -> BindSupport {
 pub fn protection_summary(os: &str) -> &'static str {
     match bind_support_for(os) {
         BindSupport::Supported => {
-            "Torrent traffic is bound to the VPN interface and cannot leave by another route."
+            "This platform can bind torrent traffic to the VPN interface, so it cannot leave by \
+             another route. No download session is running yet, so nothing is bound right now."
         }
         BindSupport::Unsupported => {
             "This platform cannot bind traffic to an interface, so swarmling watches the VPN and \
@@ -54,7 +55,15 @@ mod tests {
 
     #[test]
     fn the_summary_is_honest_about_what_each_platform_gets() {
-        assert!(protection_summary("linux").contains("bound"));
+        let linux = protection_summary("linux");
+        assert!(
+            linux.contains("can bind"),
+            "must be capability tense: {linux}"
+        );
+        assert!(
+            !linux.contains("is bound to"),
+            "must not claim a live binding that does not exist: {linux}"
+        );
         let windows = protection_summary("windows");
         assert!(
             windows.contains("cannot"),
