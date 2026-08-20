@@ -46,8 +46,19 @@ impl VpnAdapter for NordVpnAdapter {
     async fn status(&self) -> VpnStatus {
         let reported = match self.runner.run(CLI, &["status"]).await {
             Ok(out) => parse_status(&out),
-            // No CLI on this platform: interface detection is all we have.
-            Err(_) => None,
+            // No CLI on this platform (macOS and Windows ship none):
+            // interface detection is all we have.
+            Err(e) if e.is_absent() => None,
+            // The CLI exists and failed — a dead `nordvpnd`, or the user not
+            // in the right group. The authoritative source is unavailable,
+            // so we must not let the name heuristic promote a stray tunnel
+            // to "connected". Unknown is fail-closed for the guard.
+            Err(e) => {
+                return VpnStatus::Unknown(format!(
+                    "`{CLI} status` could not be read: {}",
+                    e.message()
+                ))
+            }
         };
 
         match reported {
@@ -72,7 +83,14 @@ impl VpnAdapter for NordVpnAdapter {
             .run(CLI, &["connect"])
             .await
             .map(|_| ())
-            .map_err(|e| VpnError::Unsupported(format!("could not run `{CLI} connect`: {e}")))
+            .map_err(|e| {
+                let message = format!("could not run `{CLI} connect`: {}", e.message());
+                if e.is_absent() {
+                    VpnError::Unsupported(message)
+                } else {
+                    VpnError::Control(message)
+                }
+            })
     }
 }
 
@@ -131,12 +149,27 @@ mod tests {
     #[tokio::test]
     async fn a_missing_cli_falls_back_to_interface_detection() {
         let cmds = Arc::new(FakeCommands::new());
-        cmds.fail("nordvpn", "command not found");
+        cmds.absent("nordvpn");
         let ifaces = Arc::new(FakeInterfaces::new(vec![iface("utun2")]));
         let adapter = NordVpnAdapter::new(cmds, ifaces);
         match adapter.status().await {
             VpnStatus::Connected { interface } => assert_eq!(interface.name, "utun2"),
             other => panic!("expected fallback Connected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_exists_but_fails_is_unknown_not_a_heuristic_guess() {
+        // `nordvpnd` dead, or the user not in the `nordvpn` group. A stray
+        // tunnel device must not be promoted to "connected" here.
+        let cmds = Arc::new(FakeCommands::new());
+        cmds.fail("nordvpn", "daemon is not running");
+        let ifaces = Arc::new(FakeInterfaces::new(vec![iface("utun2")]));
+        match NordVpnAdapter::new(cmds, ifaces).status().await {
+            VpnStatus::Unknown(reason) => {
+                assert!(reason.contains("daemon is not running"), "{reason}")
+            }
+            other => panic!("a failing CLI must fail closed, got {other:?}"),
         }
     }
 
@@ -158,12 +191,24 @@ mod tests {
     #[tokio::test]
     async fn connect_without_a_cli_is_unsupported() {
         let cmds = Arc::new(FakeCommands::new());
-        cmds.fail("nordvpn", "command not found");
+        cmds.absent("nordvpn");
         let ifaces = Arc::new(FakeInterfaces::new(vec![]));
         let err = NordVpnAdapter::new(cmds, ifaces)
             .connect()
             .await
             .unwrap_err();
         assert!(matches!(err, VpnError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn connect_with_a_failing_cli_is_a_control_error() {
+        let cmds = Arc::new(FakeCommands::new());
+        cmds.fail("nordvpn", "you are not logged in");
+        let ifaces = Arc::new(FakeInterfaces::new(vec![]));
+        let err = NordVpnAdapter::new(cmds, ifaces)
+            .connect()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VpnError::Control(_)), "got {err:?}");
     }
 }
