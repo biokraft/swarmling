@@ -55,11 +55,9 @@ impl TextField {
             return;
         }
         self.clamp_cursor();
-        let at = self.cursor;
-        for (offset, ch) in clean.chars().enumerate() {
-            self.chars.insert(at + offset, ch);
-        }
-        self.cursor = at + clean.chars().count();
+        let added = clean.chars().count();
+        self.chars.splice(self.cursor..self.cursor, clean.chars());
+        self.cursor += added;
         self.sync_cache();
     }
 
@@ -435,5 +433,21 @@ mod tests {
         let (text, col) = f.view(0);
         assert_eq!(text, "");
         assert_eq!(col, 0);
+    }
+
+    #[test]
+    fn a_large_paste_lands_intact_at_the_cursor() {
+        // A magnet copied from a page can be long. This pins the value and the
+        // cursor after a bulk insert; the splice that makes it linear must not
+        // change either.
+        let mut f = TextField::with_value("ab");
+        f.home();
+        f.right();
+        let pasted: String = "x".repeat(5000);
+        f.insert(&pasted);
+        assert_eq!(f.value().chars().count(), 5002);
+        assert_eq!(f.cursor(), 5001);
+        assert!(f.value().starts_with('a'));
+        assert!(f.value().ends_with('b'));
     }
 }
