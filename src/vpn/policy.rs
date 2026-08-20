@@ -15,8 +15,12 @@ pub enum BindSupport {
 
 pub fn bind_support_for(os: &str) -> BindSupport {
     match os {
-        "windows" => BindSupport::Unsupported,
-        _ => BindSupport::Supported,
+        "linux" | "macos" => BindSupport::Supported,
+        // Everything else — Windows, FreeBSD, Android, iOS — either has no
+        // `BindDevice` implementation in librqbit or is untested here, so it
+        // gets the honest weaker answer rather than a guarantee we cannot
+        // keep.
+        _ => BindSupport::Unsupported,
     }
 }
 
@@ -70,6 +74,12 @@ mod tests {
             "must not overstate Windows protection: {windows}"
         );
         assert!(windows.contains("pause"));
+    }
+
+    #[test]
+    fn an_untested_platform_does_not_claim_bind_support() {
+        assert_eq!(bind_support_for("freebsd"), BindSupport::Unsupported);
+        assert_eq!(bind_support_for("android"), BindSupport::Unsupported);
     }
 
     #[test]

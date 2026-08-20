@@ -256,8 +256,11 @@ mod tests {
         use crate::vpn::policy::BindSupport;
         let result = LibrqbitEngine::new_bound_with_support(
             BindSupport::Unsupported,
-            PathBuf::from("/tmp/swarmling-test-download"),
-            PathBuf::from("/tmp/swarmling-test-session"),
+            // Relative paths: nothing is ever created, because the guard
+            // returns before any session is built, and `/tmp` is nonsense on
+            // Windows CI.
+            PathBuf::from("downloads"),
+            PathBuf::from("session"),
             "wg0",
         )
         .await;
