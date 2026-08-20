@@ -24,6 +24,25 @@ const PROVIDER_PREFIXES: &[&str] = &["nordlynx", "proton"];
 /// container networking (Flannel, kube-proxy), not a VPN.
 const NOT_VPN_PREFIXES: &[&str] = &["tunl"];
 
+/// Whether an address is one a tunnel could actually carry traffic on.
+///
+/// A device that only has a loopback or link-local address is not routing
+/// anything anywhere: on macOS the system creates `utun` devices carrying
+/// nothing but an `fe80::` address for iCloud Private Relay, Wi-Fi Calling
+/// and Handoff, and a machine with no VPN at all can have most of a dozen of
+/// them. Binding to one of those would put torrent traffic on the bare
+/// connection while we reported protection, so a name alone is never enough.
+///
+/// Private ranges are deliberately NOT excluded: real tunnels routinely carry
+/// CGNAT (`100.64.0.0/10`) or IPv6 ULA (`fd00::/8`) addresses, and filtering
+/// those would discard the genuine VPN and keep the impostors.
+pub fn is_routable(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unicast_link_local() && !v6.is_unspecified(),
+    }
+}
+
 pub fn is_vpn_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     if name == "lo" || name.starts_with("lo0") {
@@ -54,7 +73,15 @@ fn is_provider_name(name: &str) -> bool {
 /// confident. No real interface name or IP from the system is used; all tests
 /// employ synthetic data.
 pub fn detect_vpn(provider: &dyn InterfaceProvider) -> Option<Interface> {
-    let all = provider.interfaces();
+    // Enumeration yields one entry per address, so a device with several
+    // addresses appears several times. Keeping only the routable entries
+    // therefore drops any device whose addresses are *all* loopback or
+    // link-local, and keeps a device that has at least one usable address.
+    let all: Vec<Interface> = provider
+        .interfaces()
+        .into_iter()
+        .filter(|i| is_routable(&i.ip))
+        .collect();
     all.iter()
         .find(|i| is_provider_name(&i.name))
         .cloned()
@@ -105,7 +132,7 @@ impl InterfaceProvider for FakeInterfaces {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn iface(name: &str, last: u8) -> Interface {
         Interface {
@@ -200,6 +227,58 @@ mod tests {
                 is_vpn_name(name),
                 "{name} should still be detected as a VPN"
             );
+        }
+    }
+
+    fn iface_ip(name: &str, ip: IpAddr) -> Interface {
+        Interface {
+            name: name.into(),
+            ip,
+        }
+    }
+
+    #[test]
+    fn ignores_tunnels_that_only_carry_a_link_local_address() {
+        // Synthetic stand-in for the macOS system `utun` devices created by
+        // Private Relay, Wi-Fi Calling and Handoff: tunnel-shaped names
+        // carrying nothing but `fe80::`. Only the last device is a real VPN.
+        let link_local = |n: u16| IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, n));
+        let p = FakeInterfaces::new(vec![
+            iface_ip("utun0", link_local(1)),
+            iface_ip("utun1", link_local(2)),
+            iface_ip("utun2", link_local(3)),
+            iface_ip("en0", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))),
+            iface_ip("utun7", IpAddr::V4(Ipv4Addr::new(100, 90, 12, 34))),
+            iface_ip(
+                "utun7",
+                IpAddr::V6(Ipv6Addr::new(0xfd99, 0x1111, 0x2222, 0, 0, 0, 0, 1)),
+            ),
+        ]);
+        assert_eq!(detect_vpn(&p).unwrap().name, "utun7");
+    }
+
+    #[test]
+    fn a_link_local_only_machine_reports_no_vpn() {
+        let p = FakeInterfaces::new(vec![
+            iface_ip(
+                "utun0",
+                IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            ),
+            iface_ip("utun1", IpAddr::V4(Ipv4Addr::new(169, 254, 3, 4))),
+            iface_ip("lo0", IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+        ]);
+        assert!(detect_vpn(&p).is_none());
+    }
+
+    #[test]
+    fn a_tunnel_with_a_private_or_cgnat_address_is_still_a_vpn() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(100, 90, 12, 34)),
+            IpAddr::V4(Ipv4Addr::new(10, 8, 0, 6)),
+            IpAddr::V6(Ipv6Addr::new(0xfd99, 0, 0, 0, 0, 0, 0, 2)),
+        ] {
+            let p = FakeInterfaces::new(vec![iface_ip("wg0", ip)]);
+            assert_eq!(detect_vpn(&p).unwrap().name, "wg0", "{ip} should count");
         }
     }
 
