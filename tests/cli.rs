@@ -99,3 +99,67 @@ fn vpn_require_rejects_a_bad_value() {
         .assert()
         .failure();
 }
+
+/// A magnet with a well-formed infohash, so `add` gets past parsing and
+/// reaches the VPN check. Nothing is ever transferred: `add` only writes the
+/// queue file, and here that file lives in a temporary directory.
+const VALID_MAGNET: &str =
+    "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=example";
+
+fn vpn_is_up(data_dir: &std::path::Path) -> bool {
+    let out = Command::cargo_bin("swarmling")
+        .unwrap()
+        .env("SWARMLING_DATA_DIR", data_dir)
+        .args(["vpn", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    stdout.contains("state: connected")
+}
+
+#[test]
+fn add_honours_the_vpn_requirement() {
+    let dir = tempfile::tempdir().unwrap();
+    // Turn the requirement on through the CLI itself, so the whole path is
+    // covered: settings are written, then read back by `add`.
+    Command::cargo_bin("swarmling")
+        .unwrap()
+        .env("SWARMLING_DATA_DIR", dir.path())
+        .args(["vpn", "require", "on"])
+        .assert()
+        .success();
+
+    let assertion = Command::cargo_bin("swarmling")
+        .unwrap()
+        .env("SWARMLING_DATA_DIR", dir.path())
+        .args(["add", VALID_MAGNET])
+        .assert();
+
+    // The outcome depends on whether the machine running the suite actually
+    // has a VPN up, so both branches are asserted rather than assuming one.
+    if vpn_is_up(dir.path()) {
+        assertion.success();
+    } else {
+        assertion
+            .failure()
+            .stderr(predicate::str::contains("vpn_required"));
+    }
+}
+
+#[test]
+fn add_is_not_blocked_when_the_vpn_requirement_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("swarmling")
+        .unwrap()
+        .env("SWARMLING_DATA_DIR", dir.path())
+        .args(["vpn", "require", "off"])
+        .assert()
+        .success();
+    Command::cargo_bin("swarmling")
+        .unwrap()
+        .env("SWARMLING_DATA_DIR", dir.path())
+        .args(["add", VALID_MAGNET])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added"));
+}

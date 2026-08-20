@@ -54,7 +54,7 @@ swarmling add "<magnet>" --paused   # queue it without starting it
 swarmling status                    # what is queued
 swarmling rm <infohash>             # drop it from the queue
 swarmling vpn status                # is a VPN up, and what protection you get
-swarmling vpn require on            # refuse to download unless a VPN is up
+swarmling vpn require on            # `add` refuses unless a VPN is confirmed up
 swarmling --help                    # everything else
 ```
 

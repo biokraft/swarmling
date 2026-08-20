@@ -6,6 +6,13 @@ use directories::{BaseDirs, ProjectDirs};
 /// the home dir, and finally to the working directory, so a machine with no
 /// resolvable home never crashes the app.
 pub fn data_dir() -> PathBuf {
+    // An explicit override keeps tests (and anyone running several profiles)
+    // off the real state directory. Empty means "not set".
+    if let Some(dir) = std::env::var_os("SWARMLING_DATA_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     if let Some(dirs) = ProjectDirs::from("", "", "swarmling") {
         return dirs.data_dir().to_path_buf();
     }
@@ -47,5 +54,14 @@ mod tests {
         let state = queue_state_path();
         assert!(state.starts_with(data_dir()));
         assert_eq!(state.file_name().unwrap(), "queue.json");
+
+        // The override is exercised here rather than in its own test: it
+        // mutates the process environment, which would race a sibling test
+        // running in parallel.
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SWARMLING_DATA_DIR", dir.path());
+        assert_eq!(data_dir(), dir.path());
+        assert_eq!(settings_path(), dir.path().join("settings.json"));
+        std::env::remove_var("SWARMLING_DATA_DIR");
     }
 }

@@ -39,6 +39,18 @@ impl Guard {
         &self.state
     }
 
+    /// The device protection was last established on, if any. Callers use it
+    /// to say *which* tunnel went away when reporting a paused queue.
+    pub fn last_protected_device(&self) -> Option<&str> {
+        match &self.state {
+            GuardState::Protected { device }
+            | GuardState::Lost {
+                previous_device: device,
+            } => Some(device.as_str()),
+            GuardState::Unprotected => None,
+        }
+    }
+
     pub fn observe(&mut self, status: &VpnStatus) -> GuardAction {
         match (&self.state, status) {
             (GuardState::Unprotected, VpnStatus::Connected { interface }) => {
@@ -67,9 +79,9 @@ impl Guard {
             // we cannot confirm the tunnel is up, we stop. Fail closed.
             (GuardState::Protected { device }, status) => {
                 let reason = match status {
-                    VpnStatus::Disconnected => "the VPN disconnected".to_string(),
+                    VpnStatus::Disconnected => format!("the VPN disconnected ({device})"),
                     VpnStatus::Unknown(msg) => {
-                        format!("the VPN state could not be confirmed: {msg}")
+                        format!("the VPN state on {device} could not be confirmed: {msg}")
                     }
                     VpnStatus::Connected { .. } => unreachable!("handled above"),
                 };
@@ -137,7 +149,9 @@ mod tests {
         let mut g = Guard::new();
         g.observe(&connected("wg0"));
         match g.observe(&VpnStatus::Disconnected) {
-            GuardAction::PauseAll { .. } => {}
+            // The device that was lost is named: with several tunnels up,
+            // "the VPN disconnected" alone does not say which one.
+            GuardAction::PauseAll { reason } => assert!(reason.contains("wg0"), "{reason}"),
             other => panic!("expected PauseAll, got {other:?}"),
         }
         assert_eq!(
@@ -153,9 +167,19 @@ mod tests {
         let mut g = Guard::new();
         g.observe(&connected("wg0"));
         match g.observe(&VpnStatus::Unknown("cannot tell".into())) {
-            GuardAction::PauseAll { .. } => {}
+            GuardAction::PauseAll { reason } => assert!(reason.contains("wg0"), "{reason}"),
             other => panic!("unknown must fail closed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_lost_device_is_still_reportable_after_a_drop() {
+        let mut g = Guard::new();
+        assert_eq!(g.last_protected_device(), None);
+        g.observe(&connected("wg0"));
+        assert_eq!(g.last_protected_device(), Some("wg0"));
+        g.observe(&VpnStatus::Disconnected);
+        assert_eq!(g.last_protected_device(), Some("wg0"));
     }
 
     #[test]

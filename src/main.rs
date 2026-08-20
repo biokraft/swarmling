@@ -104,10 +104,23 @@ async fn main() -> anyhow::Result<()> {
             title,
             paused,
         } => {
-            use swarmling::config::paths;
+            use swarmling::config::{paths, settings};
             use swarmling::download::persist::{load_entries, save_entries};
             use swarmling::download::queue::QueueEntry;
             use swarmling::sources::magnet::parse_magnet;
+            use swarmling::vpn::require;
+
+            // The VPN requirement is checked before anything is written to
+            // the queue. This reads interfaces and, for the nordvpn adapter,
+            // runs a read-only `nordvpn status`; it constructs no session.
+            let cfg = settings::load(&paths::settings_path());
+            if cfg.vpn_required {
+                let status = require::adapter_for(&cfg).status().await;
+                if let Some(reason) = require::refusal_reason(cfg.vpn_required, &status) {
+                    eprintln!("error: {reason}");
+                    std::process::exit(2);
+                }
+            }
 
             let parsed = match parse_magnet(&magnet) {
                 Some(p) if !p.infohash.is_empty() => p,
@@ -195,21 +208,13 @@ async fn main() -> anyhow::Result<()> {
         // never calls `connect()` and never constructs a librqbit `Session`.
         Command::Vpn { action } => match action {
             VpnAction::Status => {
-                use std::sync::Arc;
                 use swarmling::config::{paths, settings};
-                use swarmling::util::command::SystemCommands;
-                use swarmling::vpn::adapter::{GenericAdapter, VpnAdapter, VpnStatus};
-                use swarmling::vpn::interfaces::SystemInterfaces;
-                use swarmling::vpn::nordvpn::NordVpnAdapter;
+                use swarmling::vpn::adapter::VpnStatus;
                 use swarmling::vpn::policy::protection_summary;
+                use swarmling::vpn::require;
 
                 let cfg = settings::load(&paths::settings_path());
-                let provider = Arc::new(SystemInterfaces);
-                let adapter: Box<dyn VpnAdapter> = if cfg.vpn_adapter == "nordvpn" {
-                    Box::new(NordVpnAdapter::new(Arc::new(SystemCommands), provider))
-                } else {
-                    Box::new(GenericAdapter::new(provider))
-                };
+                let adapter = require::adapter_for(&cfg);
 
                 println!("adapter: {}", adapter.name());
                 match adapter.status().await {
