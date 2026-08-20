@@ -24,6 +24,7 @@ pub enum Sort {
 pub struct Row {
     pub result: SearchResult,
     pub reports_health: bool,
+    pub groups: &'static [SourceGroup],
 }
 
 pub struct Results {
@@ -122,6 +123,7 @@ impl Results {
         &mut self,
         source_id: &'static str,
         reports_health: bool,
+        groups: &'static [SourceGroup],
         results: Vec<SearchResult>,
     ) {
         for result in results {
@@ -131,6 +133,7 @@ impl Results {
             let row = Row {
                 result,
                 reports_health,
+                groups,
             };
             match self
                 .all
@@ -261,10 +264,10 @@ impl Results {
             .all
             .iter()
             .filter(|row| !(self.hide_dead && row.reports_health && row.result.seeders == 0))
-            // `ingest` carries no group data (it takes only `source_id`,
-            // `reports_health` and the rows), and `Row` does not store one,
-            // so there is nothing here to restrict by yet. `set_group` still
-            // records the caller's choice.
+            .filter(|row| match self.group {
+                None => true,
+                Some(g) => row.groups.contains(&g),
+            })
             .filter_map(|row| {
                 filter_score(&row.result.title, &toks).map(|score| (row.clone(), score))
             })
@@ -352,11 +355,13 @@ mod tests {
         r.ingest(
             "yts",
             true,
+            &[SourceGroup::Movies],
             vec![row("healthy dead", 0, 1, "yts", &hash(1))],
         );
         r.ingest(
             "fitgirl",
             false,
+            &[SourceGroup::Games],
             vec![row("quiet source", 0, 1, "fitgirl", &hash(2))],
         );
         r.toggle_hide_dead();
@@ -371,10 +376,16 @@ mod tests {
     #[test]
     fn duplicates_collapse_keeping_the_better_seeded_copy() {
         let mut r = Results::new();
-        r.ingest("yts", true, vec![row("film", 5, 100, "yts", &hash(1))]);
+        r.ingest(
+            "yts",
+            true,
+            &[SourceGroup::Movies],
+            vec![row("film", 5, 100, "yts", &hash(1))],
+        );
         r.ingest(
             "tpb-movies",
             true,
+            &[SourceGroup::Movies],
             vec![row("film", 50, 100, "tpb-movies", &hash(1))],
         );
         assert_eq!(r.visible().len(), 1);
@@ -389,6 +400,7 @@ mod tests {
         r.ingest(
             "yts",
             true,
+            &[SourceGroup::Movies],
             vec![
                 row("b", 10, 1, "yts", &hash(1)),
                 row("a", 10, 1, "yts", &hash(2)),
@@ -433,6 +445,7 @@ mod tests {
         r.ingest(
             "yts",
             true,
+            &[SourceGroup::Movies],
             vec![
                 row("big buck bunny", 1, 1, "yts", &hash(1)),
                 row("bunny big feet", 1, 1, "yts", &hash(2)),
@@ -455,6 +468,7 @@ mod tests {
         r.ingest(
             "yts",
             true,
+            &[SourceGroup::Movies],
             vec![
                 row("aaa match", 1, 900, "yts", &hash(1)),
                 row("match zzz", 1, 100, "yts", &hash(2)),
@@ -474,6 +488,7 @@ mod tests {
         r.ingest(
             "yts",
             true,
+            &[SourceGroup::Movies],
             vec![
                 row("first", 90, 1, "yts", &hash(1)),
                 row("second", 80, 1, "yts", &hash(2)),
@@ -485,6 +500,7 @@ mod tests {
         r.ingest(
             "tpb-movies",
             true,
+            &[SourceGroup::Movies],
             vec![row("newcomer", 999, 1, "tpb-movies", &hash(3))],
         );
         assert_eq!(
@@ -500,6 +516,7 @@ mod tests {
         r.ingest(
             "yts",
             true,
+            &[SourceGroup::Movies],
             vec![
                 row("a", 9, 1, "yts", &hash(1)),
                 row("b", 8, 1, "yts", &hash(2)),
@@ -527,7 +544,7 @@ mod tests {
         let rows: Vec<SearchResult> = (1..=5)
             .map(|i| row(&format!("r{i}"), 100 - i, 1, "yts", &hash(i as u8)))
             .collect();
-        r.ingest("yts", true, rows);
+        r.ingest("yts", true, &[SourceGroup::Movies], rows);
         r.page(-1, 3);
         assert_eq!(r.cursor(), 0, "page up clamps at the top");
         r.page(1, 3);
@@ -535,6 +552,37 @@ mod tests {
         assert_eq!(r.cursor(), 4, "page down clamps at the bottom");
         r.move_cursor(1, true);
         assert_eq!(r.cursor(), 0, "stepping down from the last row wraps");
+    }
+
+    #[test]
+    fn the_category_tab_restricts_the_list_to_that_group() {
+        // A tab that silently fails to filter is worse than no tab: the user
+        // believes they are looking at one category while seeing everything.
+        let mut r = Results::new();
+        r.ingest(
+            "yts",
+            true,
+            &[SourceGroup::Movies],
+            vec![row("a film", 10, 1, "yts", &hash(1))],
+        );
+        r.ingest(
+            "nyaa",
+            true,
+            &[SourceGroup::Anime],
+            vec![row("an episode", 10, 1, "nyaa", &hash(2))],
+        );
+        assert_eq!(r.visible().len(), 2, "the All tab shows everything");
+
+        r.set_group(Some(SourceGroup::Anime));
+        let titles: Vec<&str> = r
+            .visible()
+            .iter()
+            .map(|x| x.result.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["an episode"]);
+
+        r.set_group(None);
+        assert_eq!(r.visible().len(), 2, "clearing the tab restores everything");
     }
 
     #[test]

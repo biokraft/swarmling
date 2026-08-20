@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 use super::magnet::is_infohash;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceGroup {
     Games,
     Movies,
