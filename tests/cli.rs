@@ -39,8 +39,13 @@ fn help_lists_the_download_subcommands() {
 
 #[test]
 fn add_requires_a_magnet_argument() {
+    // Isolated state: without it this reads the real user's settings, where a
+    // `vpn_required` gate would fail the command before clap's check and pass
+    // the test for the wrong reason.
+    let dir = tempfile::tempdir().unwrap();
     Command::cargo_bin("swarmling")
         .unwrap()
+        .env("SWARMLING_DATA_DIR", dir.path())
         .arg("add")
         .assert()
         .failure(); // clap rejects the missing positional before any network work happens
@@ -60,8 +65,10 @@ fn rm_rejects_a_bare_integer_instead_of_an_infohash() {
     // librqbit's own parser treats a bare integer as a session INDEX, so a
     // typo like `rm 0` must be rejected at the CLI before it can reach the
     // engine and delete an unrelated torrent.
+    let dir = tempfile::tempdir().unwrap();
     Command::cargo_bin("swarmling")
         .unwrap()
+        .env("SWARMLING_DATA_DIR", dir.path())
         .args(["rm", "0"])
         .assert()
         .failure()
@@ -70,11 +77,17 @@ fn rm_rejects_a_bare_integer_instead_of_an_infohash() {
 
 #[test]
 fn add_rejects_a_magnet_with_no_usable_infohash() {
+    let dir = tempfile::tempdir().unwrap();
     Command::cargo_bin("swarmling")
         .unwrap()
+        .env("SWARMLING_DATA_DIR", dir.path())
         .args(["add", "magnet:?dn=no+hash+here"])
         .assert()
-        .failure();
+        .failure()
+        // Assert the reason, not just the exit code: a VPN gate or any other
+        // early refusal also fails, and would hide a parser that stopped
+        // rejecting hashless magnets.
+        .stderr(predicate::str::contains("infohash"));
 }
 
 #[test]
@@ -138,7 +151,13 @@ fn add_honours_the_vpn_requirement() {
     // The outcome depends on whether the machine running the suite actually
     // has a VPN up, so both branches are asserted rather than assuming one.
     if vpn_is_up(dir.path()) {
-        assertion.success();
+        // This branch pins little: an `add` that ignored the setting entirely
+        // would also succeed here. The refusal logic itself is pinned
+        // deterministically by the unit tests in `src/vpn/require.rs`; on CI,
+        // where no tunnel is up, the branch below is the one that runs.
+        assertion
+            .success()
+            .stdout(predicate::str::contains("added"));
     } else {
         assertion
             .failure()

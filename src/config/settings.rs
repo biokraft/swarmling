@@ -70,7 +70,8 @@ pub fn load(path: &Path) -> Settings {
     match serde_json::from_slice::<Envelope>(&bytes) {
         Ok(env) if env.version > CURRENT_VERSION => {
             eprintln!(
-                "warn: {} was written by a newer swarmling (version {}, this build understands {});                  keeping safe settings instead of half-reading it",
+                "warn: {} was written by a newer swarmling (version {}, this build \
+                 understands {}); keeping safe settings instead of half-reading it",
                 path.display(),
                 env.version,
                 CURRENT_VERSION
