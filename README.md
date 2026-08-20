@@ -58,6 +58,8 @@ swarmling vpn require on            # `add` refuses unless a VPN is confirmed up
 swarmling --help                    # everything else
 ```
 
+`SWARMLING_DATA_DIR` overrides where the queue and settings are kept, if you want more than one profile.
+
 Search prints one result per line — seeders, size, title, magnet — as each source answers. A source that is down produces a warning on stderr and the search carries on without it.
 
 ## What it searches
