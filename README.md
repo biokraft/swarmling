@@ -27,7 +27,8 @@ The Rust rewrite is being built milestone by milestone. This table is the honest
 | Download queue, persisted across restarts | **Works** (records what you asked for) |
 | Actually transferring files | **Not yet wired** — see below |
 | Terminal UI | Planned |
-| VPN guard and kill switch | Planned |
+| VPN detection, bind policy, `vpn status` | **Works** |
+| VPN kill switch applied to live torrents | Not yet wired — waits on the long-running process |
 | Seeding controls, headless and daemon modes | Planned |
 
 Downloading is the interesting omission. The engine adapter is written and tested through its trait, but no command in the current CLI opens a live torrent session — because merely opening one starts talking to trackers and the DHT, and the VPN guard that should sit in front of that traffic does not exist yet. Transfers get wired up when there is a long-running, VPN-guarded process to own them. That ordering is deliberate.
@@ -52,6 +53,8 @@ swarmling add "<magnet>"            # queue a download (records intent)
 swarmling add "<magnet>" --paused   # queue it without starting it
 swarmling status                    # what is queued
 swarmling rm <infohash>             # drop it from the queue
+swarmling vpn status                # is a VPN up, and what protection you get
+swarmling vpn require on            # refuse to download unless a VPN is up
 swarmling --help                    # everything else
 ```
 
@@ -77,6 +80,8 @@ Planned, and the main reason this fork exists. Two layers:
 **The core works with any VPN, with no configuration.** swarmling finds the active VPN interface (`tun`/`wg`/`utun` and friends), binds torrent traffic to it so nothing leaks onto your bare connection, and watches it. If the interface disappears or its address changes, every torrent pauses immediately and resumes when the tunnel is back.
 
 **Adapters add provider-specific control** through a small trait — status, interface, connect. Adapters shell out to the provider's own CLI, so no credentials ever pass through swarmling. NordVPN ships first; more are welcome as pull requests, the same way sources are.
+
+**Windows gets the weaker half, and swarmling says so.** Binding a socket to a network device is a Linux and macOS capability; on Windows the underlying call is unsupported outright. So on Windows there is no binding — only detect-and-pause, which cannot prevent a leak in the moments before a dropped tunnel is noticed. `swarmling vpn status` reports which of the two you are actually getting rather than claiming protection it cannot deliver.
 
 ## Credit
 
