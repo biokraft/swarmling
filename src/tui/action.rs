@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::download::queue::QueueEntry;
 use crate::sources::SearchResult;
 
 /// Everything that can move the app forward.
@@ -26,6 +27,10 @@ pub enum Action {
     },
     SearchFinished,
     Notice(String),
+    /// The event loop created and persisted a new default download directory.
+    DownloadDirChanged(PathBuf),
+    /// The event loop rewrote the queue file; this is its new contents.
+    QueueChanged(Vec<QueueEntry>),
 }
 
 /// A key press already resolved to its meaning. The terminal layer owns the

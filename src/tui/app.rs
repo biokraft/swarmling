@@ -85,8 +85,11 @@ pub enum Mode {
 pub enum Overlay {
     None,
     Help,
-    /// The "download to…" prompt. Its pending torrent lives in
-    /// [`App::pending`] so the overlay itself stays `Copy`.
+    /// The "set the default download folder" prompt, opened by `o`. It needs
+    /// no selection and never queues anything.
+    FolderPrompt,
+    /// The per-torrent "download to…" prompt, opened by `D`. Its pending
+    /// torrent lives in [`App::pending`] so the overlay itself stays `Copy`.
     DownloadTo,
 }
 
@@ -117,6 +120,9 @@ pub struct App {
     pub queue: Vec<QueueEntry>,
     pub queue_cursor: usize,
     pub download_dir: PathBuf,
+    /// The destination last typed into the `D` prompt this session. It seeds
+    /// the next `D` prompt but is never the default download folder.
+    pub last_download_to: Option<PathBuf>,
     pub query: String,
     pub searching: bool,
     pub notice: Option<Notice>,
@@ -142,6 +148,7 @@ impl App {
             queue,
             queue_cursor: 0,
             download_dir,
+            last_download_to: None,
             query: String::new(),
             searching: false,
             notice: None,
@@ -208,13 +215,9 @@ impl App {
             self.set_notice(format!("Already in queue: {title}"));
             return Vec::new();
         }
-        self.queue.push(QueueEntry {
-            infohash: parsed.infohash.clone(),
-            magnet: magnet.to_owned(),
-            title: title.clone(),
-            added_unix: 0,
-            paused: false,
-        });
+        // No optimistic mutation: the queue file is the single source of
+        // truth. The event loop writes it and reports back with
+        // `Action::QueueChanged`, or with `Action::Notice` if it failed.
         self.set_notice(format!("Queued: {title}"));
         vec![Effect::AddToQueue {
             infohash: parsed.infohash,
@@ -270,6 +273,15 @@ impl App {
                 self.searching = false;
                 Vec::new()
             }
+            Action::DownloadDirChanged(dir) => {
+                self.download_dir = dir;
+                Vec::new()
+            }
+            Action::QueueChanged(queue) => {
+                self.queue = queue;
+                self.queue_cursor = self.queue_cursor.min(self.queue.len().saturating_sub(1));
+                Vec::new()
+            }
             Action::Key(key) => self.on_key(key),
         }
     }
@@ -296,6 +308,29 @@ impl App {
                 self.overlay = Overlay::None;
                 Vec::new()
             }
+            Overlay::FolderPrompt => match key {
+                KeyAction::Escape => {
+                    self.overlay = Overlay::None;
+                    self.field.clear();
+                    Vec::new()
+                }
+                KeyAction::Enter => {
+                    let dir = PathBuf::from(self.field.value().trim());
+                    self.overlay = Overlay::None;
+                    self.field.clear();
+                    if dir.as_os_str().is_empty() {
+                        self.set_notice("Enter a destination folder");
+                        return Vec::new();
+                    }
+                    // `download_dir` changes only once the event loop has
+                    // created and persisted the folder and told us so.
+                    vec![Effect::SaveDownloadDir(dir)]
+                }
+                other => {
+                    self.edit_field(&other);
+                    Vec::new()
+                }
+            },
             Overlay::DownloadTo => match key {
                 KeyAction::Escape => {
                     self.overlay = Overlay::None;
@@ -314,9 +349,13 @@ impl App {
                         self.set_notice("Enter a destination folder");
                         return Vec::new();
                     }
-                    self.download_dir = dir.clone();
-                    let mut effects = vec![Effect::SaveDownloadDir(dir.clone())];
-                    effects.extend(self.queue_magnet(&pending.magnet, Some(&pending.title), dir));
+                    // A per-torrent destination is not the new default.
+                    self.last_download_to = Some(dir.clone());
+                    let effects = self.queue_magnet(&pending.magnet, Some(&pending.title), dir);
+                    if !effects.is_empty() {
+                        self.set_section(Section::Downloads);
+                        self.region = Region::Content;
+                    }
                     effects
                 }
                 other => {
@@ -531,7 +570,16 @@ impl App {
                 Vec::new()
             }
             KeyAction::Download => self.download_selected(None),
-            KeyAction::DownloadTo | KeyAction::FolderPrompt => {
+            KeyAction::FolderPrompt => {
+                // Settings, not a download: no selection needed, and it can
+                // never queue anything.
+                self.overlay = Overlay::FolderPrompt;
+                self.field
+                    .set_value(self.download_dir.to_string_lossy().as_ref());
+                self.field.end();
+                Vec::new()
+            }
+            KeyAction::DownloadTo => {
                 let Some((magnet, title)) = self.selected_magnet() else {
                     return Vec::new();
                 };
@@ -545,8 +593,11 @@ impl App {
                     title,
                 });
                 self.overlay = Overlay::DownloadTo;
-                self.field
-                    .set_value(self.download_dir.to_string_lossy().as_ref());
+                let prefill = self
+                    .last_download_to
+                    .clone()
+                    .unwrap_or_else(|| self.download_dir.clone());
+                self.field.set_value(prefill.to_string_lossy().as_ref());
                 self.field.end();
                 Vec::new()
             }
@@ -565,16 +616,12 @@ impl App {
                     return Vec::new();
                 };
                 let infohash = entry.infohash.clone();
-                self.queue.retain(|e| e.infohash != infohash);
-                self.queue_cursor = self.queue_cursor.min(self.queue.len().saturating_sub(1));
                 vec![Effect::RemoveFromQueue(infohash)]
             }
             KeyAction::ClearQueue => {
                 if self.section != Section::Downloads || self.queue.is_empty() {
                     return Vec::new();
                 }
-                self.queue.clear();
-                self.queue_cursor = 0;
                 vec![Effect::ClearQueue]
             }
             KeyAction::Insert(_)
@@ -628,10 +675,17 @@ mod tests {
         a.update(Action::Key(KeyAction::Insert(magnet.into())));
         let effects = a.update(Action::Key(KeyAction::Enter));
         assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::AddToQueue { .. })),
+            !effects.iter().any(|e| matches!(e, Effect::StartSearch(_))),
             "a pasted magnet is an intent to download, not a query"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::AddToQueue { infohash, dir, .. }
+                    if infohash == "0123456789abcdef0123456789abcdef01234567"
+                        && dir == &std::path::PathBuf::from("/tmp/does-not-need-to-exist")
+            )),
+            "the magnet's infohash and the default folder must reach the queue"
         );
         assert_eq!(a.section, Section::Downloads);
     }
@@ -680,7 +734,14 @@ mod tests {
                 .any(|e| matches!(e, Effect::AddToQueue { .. })),
             "a duplicate must not be queued twice"
         );
-        assert!(a.notice.is_some());
+        assert!(
+            a.notice_text()
+                .unwrap_or_default()
+                .starts_with("Already in queue"),
+            "the refusal must say why: {:?}",
+            a.notice_text()
+        );
+        assert_eq!(a.queue.len(), 1, "the queue must be untouched");
     }
 
     #[test]
@@ -712,7 +773,9 @@ mod tests {
         let mut a = app();
         a.update(Action::Key(KeyAction::Enter));
         a.results.set_filter("something");
-        a.set_section(Section::Games);
+        a.region = Region::Sidebar;
+        a.update(Action::Key(KeyAction::Down)); // All -> Games
+        assert_eq!(a.section, Section::Games);
         assert_eq!(a.results.filter(), "");
     }
 
@@ -741,7 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn quitting_is_the_only_way_should_quit_becomes_true() {
+    fn the_quit_key_sets_should_quit_and_emits_the_quit_effect() {
         let mut a = app();
         a.update(Action::Key(KeyAction::Enter));
         assert!(!a.should_quit);
@@ -790,14 +853,42 @@ mod tests {
         let effects = a.update(Action::Key(KeyAction::Enter));
         assert_eq!(a.overlay, Overlay::None);
         assert!(
-            effects.contains(&Effect::SaveDownloadDir(std::path::PathBuf::from(
-                "/tmp/elsewhere"
-            )))
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::AddToQueue { dir, .. } if dir == &std::path::PathBuf::from("/tmp/elsewhere")
+            )),
+            "D must queue to the folder the user typed"
         );
-        assert!(effects.iter().any(|e| matches!(
-            e,
-            Effect::AddToQueue { dir, .. } if dir == &std::path::PathBuf::from("/tmp/elsewhere")
-        )));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SaveDownloadDir(_))),
+            "a per-torrent destination is not the new default folder"
+        );
+        assert_eq!(
+            a.download_dir,
+            std::path::PathBuf::from("/tmp/does-not-need-to-exist")
+        );
+        assert_eq!(
+            a.last_download_to,
+            Some(std::path::PathBuf::from("/tmp/elsewhere"))
+        );
+        assert_eq!(
+            a.section,
+            Section::Downloads,
+            "a successful D shows the queue"
+        );
+    }
+
+    #[test]
+    fn the_download_to_prompt_is_prefilled_with_the_last_destination_not_the_default() {
+        let mut a = browsing_with_one_result();
+        a.update(Action::Key(KeyAction::DownloadTo));
+        a.update(Action::Key(KeyAction::ClearField));
+        a.update(Action::Key(KeyAction::Insert("/tmp/elsewhere".into())));
+        a.update(Action::Key(KeyAction::Enter));
+        a.update(Action::Key(KeyAction::DownloadTo));
+        assert_eq!(a.field.value(), "/tmp/elsewhere");
     }
 
     #[test]
@@ -849,5 +940,78 @@ mod tests {
         a.region = Region::Content;
         assert!(a.update(Action::Key(KeyAction::RemoveEntry)).is_empty());
         assert!(a.update(Action::Key(KeyAction::ClearQueue)).is_empty());
+    }
+
+    #[test]
+    fn the_folder_prompt_opens_with_nothing_selected_and_no_results() {
+        let mut a = app();
+        a.update(Action::Key(KeyAction::Enter));
+        assert!(a.results.visible().is_empty());
+        assert!(a.results.selected().is_none());
+        let effects = a.update(Action::Key(KeyAction::FolderPrompt));
+        assert!(effects.is_empty());
+        assert_eq!(
+            a.overlay,
+            Overlay::FolderPrompt,
+            "o is a settings key: it must not need a selection"
+        );
+        assert_eq!(a.field.value(), "/tmp/does-not-need-to-exist");
+    }
+
+    #[test]
+    fn submitting_the_folder_prompt_saves_the_folder_and_queues_nothing() {
+        let mut a = browsing_with_one_result();
+        a.update(Action::Key(KeyAction::FolderPrompt));
+        a.update(Action::Key(KeyAction::ClearField));
+        a.update(Action::Key(KeyAction::Insert("/tmp/newdefault".into())));
+        let effects = a.update(Action::Key(KeyAction::Enter));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::SaveDownloadDir(std::path::PathBuf::from(
+                "/tmp/newdefault"
+            ))],
+            "o sets the default folder and does nothing else"
+        );
+        assert_eq!(a.overlay, Overlay::None);
+        assert_eq!(
+            a.download_dir,
+            std::path::PathBuf::from("/tmp/does-not-need-to-exist"),
+            "the folder changes only when the event loop confirms it"
+        );
+    }
+
+    #[test]
+    fn escaping_the_folder_prompt_emits_nothing() {
+        let mut a = browsing_with_one_result();
+        a.update(Action::Key(KeyAction::FolderPrompt));
+        let effects = a.update(Action::Key(KeyAction::Escape));
+        assert!(effects.is_empty());
+        assert_eq!(a.overlay, Overlay::None);
+        assert_eq!(
+            a.download_dir,
+            std::path::PathBuf::from("/tmp/does-not-need-to-exist")
+        );
+    }
+
+    #[test]
+    fn the_event_loop_owns_the_queue_and_the_default_folder() {
+        let mut a = app();
+        a.update(Action::DownloadDirChanged(std::path::PathBuf::from(
+            "/tmp/confirmed",
+        )));
+        assert_eq!(a.download_dir, std::path::PathBuf::from("/tmp/confirmed"));
+        a.update(Action::QueueChanged(vec![
+            crate::download::queue::QueueEntry {
+                infohash: "aa".repeat(20),
+                magnet: "magnet:?xt=urn:btih:".to_owned() + &"aa".repeat(20),
+                title: "t".into(),
+                added_unix: 0,
+                paused: false,
+            },
+        ]));
+        assert_eq!(a.queue.len(), 1);
+        a.update(Action::QueueChanged(Vec::new()));
+        assert_eq!(a.queue.len(), 0);
+        assert_eq!(a.queue_cursor, 0);
     }
 }
