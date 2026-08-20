@@ -57,7 +57,25 @@ impl LibrqbitEngine {
         session_dir: PathBuf,
         device: &str,
     ) -> Result<Self, EngineError> {
-        if crate::vpn::policy::bind_support() == crate::vpn::policy::BindSupport::Unsupported {
+        Self::new_bound_with_support(
+            crate::vpn::policy::bind_support(),
+            download_dir,
+            session_dir,
+            device,
+        )
+        .await
+    }
+
+    /// Body of `new_bound`, parameterized on the support value so the refusal
+    /// path can be pinned by a test on every platform, without ever calling
+    /// `Session::new_with_opts` in the process.
+    async fn new_bound_with_support(
+        support: crate::vpn::policy::BindSupport,
+        download_dir: PathBuf,
+        session_dir: PathBuf,
+        device: &str,
+    ) -> Result<Self, EngineError> {
+        if support == crate::vpn::policy::BindSupport::Unsupported {
             return Err(EngineError::BindUnsupported(format!(
                 "this platform cannot bind torrent traffic to interface {device:?}; \
                  refusing to start an unprotected session"
@@ -228,14 +246,21 @@ mod tests {
         ));
     }
 
-    // `new_bound` itself is not called here: doing so would construct a real
-    // librqbit `Session`. Instead this pins down the policy check it guards
-    // itself with — on Windows, `bind_support_for` reports `Unsupported`,
-    // which is exactly what makes `new_bound` refuse before touching
-    // `Session::new_with_opts`.
-    #[test]
-    fn windows_is_unsupported_so_new_bound_refuses_there() {
-        use crate::vpn::policy::{bind_support_for, BindSupport};
-        assert_eq!(bind_support_for("windows"), BindSupport::Unsupported);
+    // Only the refusing arm (`BindSupport::Unsupported`) is exercised here.
+    // Passing `Supported` would fall through to `Session::new_with_opts`,
+    // constructing a real librqbit session and starting DHT/LSD traffic —
+    // forbidden by project policy regardless of test intent. This is safe
+    // precisely because the guard returns before any session is built.
+    #[tokio::test]
+    async fn new_bound_with_support_refuses_when_unsupported() {
+        use crate::vpn::policy::BindSupport;
+        let result = LibrqbitEngine::new_bound_with_support(
+            BindSupport::Unsupported,
+            PathBuf::from("/tmp/swarmling-test-download"),
+            PathBuf::from("/tmp/swarmling-test-session"),
+            "wg0",
+        )
+        .await;
+        assert!(matches!(result, Err(EngineError::BindUnsupported(_))));
     }
 }

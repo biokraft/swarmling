@@ -92,6 +92,9 @@ mod tests {
         let bad = dir.path().join("bad.json");
         std::fs::write(&bad, b"{ not json").unwrap();
         assert_eq!(load(&bad), Settings::default());
+        let wrong_shape = dir.path().join("wrong-shape.json");
+        std::fs::write(&wrong_shape, br#"{"settings":[]}"#).unwrap();
+        assert_eq!(load(&wrong_shape), Settings::default());
     }
 
     #[test]

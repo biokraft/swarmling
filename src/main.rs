@@ -225,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 println!("protection: {}", protection_summary(std::env::consts::OS));
+                println!("vpn_required: {}", cfg.vpn_required);
             }
             VpnAction::Require { value } => {
                 use swarmling::config::{paths, settings};
