@@ -175,7 +175,7 @@ mod tests {
         // carry no swarm data at all. Filtering them on seeder count would hide
         // every result from them while telling the user they were dead.
         use crate::sources::registry::all_sources;
-        let quiet = ["fitgirl", "subsplease", "bittorrented"];
+        let quiet = ["fitgirl", "subsplease"];
         for source in all_sources() {
             let expected = !quiet.contains(&source.id());
             assert_eq!(

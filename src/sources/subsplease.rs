@@ -132,6 +132,11 @@ impl Source for Subsplease {
         Ok(out)
     }
 
+    /// This source's feed carries no swarm data, so `seeders` is hardcoded to
+    /// 0 for every row. That is "unknown", not "dead" — the hide-dead filter
+    /// must leave these rows alone. A source that parses a real seeder count
+    /// from its response, even one that is sometimes null, keeps the default
+    /// `true`.
     fn reports_health(&self) -> bool {
         false
     }

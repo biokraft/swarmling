@@ -104,10 +104,6 @@ impl Source for Bittorrented {
         }
         Ok(out)
     }
-
-    fn reports_health(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(test)]
