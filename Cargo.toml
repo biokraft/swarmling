@@ -36,6 +36,7 @@ librqbit = "9"
 if-addrs = "0.13"
 ratatui = "0.30"
 arboard = { version = "3", default-features = false }
+crossterm = "0.29"
 
 [dev-dependencies]
 wiremock = "0.6"

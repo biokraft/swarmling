@@ -3993,6 +3993,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "clap",
+ "crossterm",
  "directories 5.0.1",
  "futures",
  "if-addrs",
