@@ -14,15 +14,20 @@ pub trait InterfaceProvider: Send + Sync {
 /// Device-name prefixes that indicate a tunnel. Provider-specific names come
 /// first: when several tunnels are up, a device we can attribute to a known
 /// VPN is a better guess than a generic one.
-pub const VPN_PREFIXES: &[&str] = &["nordlynx", "proton", "tun", "tap", "wg", "utun", "ipsec"];
+/// `tap` is deliberately absent: `tapN` is overwhelmingly a VM or container
+/// bridge device (QEMU/KVM, libvirt, VirtualBox) bridged straight onto the
+/// LAN, and is only a VPN device for OpenVPN in the rare bridged mode. Like
+/// `ppp`, its false positives all point the unsafe way.
+pub const VPN_PREFIXES: &[&str] = &["nordlynx", "proton", "tun", "wg", "utun", "ipsec"];
 
 const PROVIDER_PREFIXES: &[&str] = &["nordlynx", "proton"];
 
 /// Prefixes that start with a VPN indicator but are NOT actually VPNs.
 /// This escape hatch handles known collisions where a name-based heuristic
 /// would produce a false positive: e.g. `tunl0` is a Linux IPIP tunnel for
-/// container networking (Flannel, kube-proxy), not a VPN.
-const NOT_VPN_PREFIXES: &[&str] = &["tunl"];
+/// container networking (Flannel, kube-proxy), not a VPN. Loopback (`lo`,
+/// `lo0`) lives here too so every known-not-a-VPN name is in one place.
+const NOT_VPN_PREFIXES: &[&str] = &["tunl", "lo"];
 
 /// Whether an address is one a tunnel could actually carry traffic on.
 ///
@@ -45,9 +50,6 @@ pub fn is_routable(ip: &IpAddr) -> bool {
 
 pub fn is_vpn_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    if name == "lo" || name.starts_with("lo0") {
-        return false;
-    }
     // Exclude known false positives before checking VPN prefixes.
     if NOT_VPN_PREFIXES.iter().any(|p| name.starts_with(p)) {
         return false;
@@ -143,9 +145,7 @@ mod tests {
 
     #[test]
     fn recognises_tunnel_device_names() {
-        for name in [
-            "tun0", "tap0", "wg0", "utun3", "ipsec1", "nordlynx", "proton0",
-        ] {
+        for name in ["tun0", "wg0", "utun3", "ipsec1", "nordlynx", "proton0"] {
             assert!(is_vpn_name(name), "{name} should count as a tunnel");
         }
     }
@@ -213,6 +213,12 @@ mod tests {
             !is_vpn_name("pppoe-wan"),
             "pppoe-wan must not count as a VPN"
         );
+    }
+
+    #[test]
+    fn rejects_tap0_which_is_usually_a_vm_bridge() {
+        assert!(!is_vpn_name("tap0"), "tap0 must not count as a VPN");
+        assert!(!is_vpn_name("tap-vm1"), "tap-vm1 must not count as a VPN");
     }
 
     #[test]
