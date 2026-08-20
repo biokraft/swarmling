@@ -78,6 +78,18 @@ pub fn is_infohash(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Extract the lowercase hex infohash from a magnet URI, if it has one.
+///
+/// Delegates to `parse_magnet` so magnet handling stays in one place, and
+/// filters through `is_infohash` because `normalize_infohash` can return a
+/// string that is not a valid hash — an invalid hash must drop the row
+/// rather than reach the queue.
+pub fn infohash_from_magnet(magnet: &str) -> Option<String> {
+    parse_magnet(magnet)
+        .map(|m| m.infohash)
+        .filter(|h| is_infohash(h))
+}
+
 /// Returns None when the input carries no usable infohash — the caller drops
 /// the row rather than building a broken magnet.
 pub fn parse_magnet(raw: &str) -> Option<ParsedMagnet> {

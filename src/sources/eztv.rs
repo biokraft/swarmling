@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use super::magnet::parse_magnet;
+use super::magnet::{infohash_from_magnet, parse_magnet};
 use super::{build_magnet, SearchResult, Source, SourceError, SourceGroup};
 
 #[derive(Deserialize)]
@@ -107,6 +107,9 @@ impl Source for Eztv {
             let Some(magnet) = build_magnet(&hash, &title, &extra_trackers) else {
                 continue;
             };
+            let Some(infohash) = infohash_from_magnet(&magnet) else {
+                continue;
+            };
             out.push(SearchResult {
                 title,
                 magnet,
@@ -114,6 +117,7 @@ impl Source for Eztv {
                 seeders: t.seeds,
                 leechers: t.peers,
                 source_id: "eztv",
+                infohash,
             });
         }
         Ok(out)

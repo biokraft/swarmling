@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use futures::future::join_all;
 use regex::Regex;
 
-use super::magnet::parse_magnet;
+use super::magnet::{infohash_from_magnet, parse_magnet};
 use super::{build_magnet, SearchResult, Source, SourceError, SourceGroup};
 use crate::util::format::{parse_size, unescape_entities};
 
@@ -192,6 +192,7 @@ impl Source for X1337 {
                 let raw = unescape_entities(MAGNET_RE.find(&html)?.as_str());
                 let parsed = parse_magnet(&raw)?;
                 let magnet = build_magnet(&parsed.infohash, &row.name, &parsed.trackers)?;
+                let infohash = infohash_from_magnet(&magnet)?;
                 Some(SearchResult {
                     magnet,
                     title: row.name,
@@ -199,6 +200,7 @@ impl Source for X1337 {
                     seeders: row.seeders,
                     leechers: row.leechers,
                     source_id: id,
+                    infohash,
                 })
             }
         });

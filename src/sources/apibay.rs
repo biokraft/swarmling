@@ -1,5 +1,6 @@
 use serde::Deserialize;
 
+use super::magnet::infohash_from_magnet;
 use super::{magnet_from_infohash, SearchResult, Source, SourceError, SourceGroup};
 
 #[derive(Deserialize)]
@@ -73,6 +74,7 @@ impl Source for Apibay {
             .into_iter()
             .filter_map(|r| {
                 let magnet = magnet_from_infohash(&r.info_hash, &r.name)?;
+                let infohash = infohash_from_magnet(&magnet)?;
                 Some(SearchResult {
                     magnet,
                     title: r.name,
@@ -80,6 +82,7 @@ impl Source for Apibay {
                     seeders: r.seeders.parse().unwrap_or(0),
                     leechers: r.leechers.parse().unwrap_or(0),
                     source_id: self.id,
+                    infohash,
                 })
             })
             .collect())

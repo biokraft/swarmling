@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use super::magnet::parse_magnet;
+use super::magnet::{infohash_from_magnet, parse_magnet};
 use super::{build_magnet, SearchResult, Source, SourceError, SourceGroup};
 
 const RES_PREFERENCE: [&str; 3] = ["1080", "720", "480"];
@@ -116,6 +116,9 @@ impl Source for Subsplease {
             let Some(magnet) = build_magnet(&parsed.infohash, &title, &parsed.trackers) else {
                 continue;
             };
+            let Some(infohash) = infohash_from_magnet(&magnet) else {
+                continue;
+            };
             out.push(SearchResult {
                 magnet,
                 title,
@@ -123,9 +126,14 @@ impl Source for Subsplease {
                 seeders: 0,
                 leechers: 0,
                 source_id: "subsplease",
+                infohash,
             });
         }
         Ok(out)
+    }
+
+    fn reports_health(&self) -> bool {
+        false
     }
 }
 

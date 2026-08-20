@@ -33,6 +33,10 @@ impl Source for Fitgirl {
     async fn search(&self, query: &str) -> Result<Vec<SearchResult>, SourceError> {
         fetch_wordpress_rss(&self.base_url, "fitgirl", query).await
     }
+
+    fn reports_health(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

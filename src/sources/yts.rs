@@ -1,5 +1,6 @@
 use serde::Deserialize;
 
+use super::magnet::infohash_from_magnet;
 use super::{magnet_from_infohash, SearchResult, Source, SourceError, SourceGroup};
 
 #[derive(Deserialize)]
@@ -75,6 +76,7 @@ impl Source for Yts {
                     .into_iter()
                     .filter_map(move |t| {
                         let magnet = magnet_from_infohash(&t.hash, &title)?;
+                        let infohash = infohash_from_magnet(&magnet)?;
                         Some(SearchResult {
                             title: format!("{title} [{}]", t.quality),
                             magnet,
@@ -82,6 +84,7 @@ impl Source for Yts {
                             seeders: t.seeds,
                             leechers: t.peers,
                             source_id: "yts",
+                            infohash,
                         })
                     })
                     .collect::<Vec<_>>()

@@ -17,6 +17,10 @@ pub struct SearchResult {
     pub seeders: u32,
     pub leechers: u32,
     pub source_id: &'static str,
+    /// Lowercase hex infohash, parsed from the magnet at construction.
+    /// Used to deduplicate results across sources and to keep the list
+    /// cursor on the same row when results are replaced mid-search.
+    pub infohash: String,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -32,6 +36,16 @@ pub trait Source: Send + Sync {
     fn id(&self) -> &'static str;
     fn groups(&self) -> &'static [SourceGroup];
     async fn search(&self, query: &str) -> Result<Vec<SearchResult>, SourceError>;
+
+    /// Whether this source's `seeders`/`leechers` counts mean anything.
+    ///
+    /// A source whose feed carries no swarm data reports `seeders: 0` for
+    /// every row. That is "unknown", not "dead", so the hide-dead filter
+    /// must leave those rows alone — otherwise it hides real results and
+    /// tells the user they were dead.
+    fn reports_health(&self) -> bool {
+        true
+    }
 }
 
 /// Public trackers attached to every magnet we build, so a torrent is findable
@@ -153,5 +167,40 @@ mod tests {
         let bogus = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
         assert_eq!(bogus.len(), 40);
         assert_eq!(build_magnet(bogus, "Name", &[]), None);
+    }
+
+    #[test]
+    fn sources_without_swarm_data_do_not_report_health() {
+        // These sources report `seeders: 0` for every row because their feeds
+        // carry no swarm data at all. Filtering them on seeder count would hide
+        // every result from them while telling the user they were dead.
+        use crate::sources::registry::all_sources;
+        let quiet = ["fitgirl", "subsplease", "bittorrented"];
+        for source in all_sources() {
+            let expected = !quiet.contains(&source.id());
+            assert_eq!(
+                source.reports_health(),
+                expected,
+                "{} reports_health() is wrong",
+                source.id()
+            );
+        }
+    }
+
+    #[test]
+    fn a_result_carries_a_usable_infohash() {
+        // Every row the UI shows must be actionable. A row with no infohash
+        // cannot be deduplicated, queued, or downloaded, so it must never
+        // reach the list in the first place.
+        let magnet = build_magnet("0123456789abcdef0123456789abcdef01234567", "example", &[])
+            .expect("a valid infohash builds a magnet");
+        assert_eq!(
+            crate::sources::magnet::infohash_from_magnet(&magnet).as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            crate::sources::magnet::infohash_from_magnet("magnet:?dn=no+hash"),
+            None
+        );
     }
 }

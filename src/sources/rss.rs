@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use super::magnet::parse_magnet;
+use super::magnet::{infohash_from_magnet, parse_magnet};
 use super::{build_magnet, SearchResult, SourceError};
 use crate::util::format::{tag, unescape_entities};
 
@@ -31,6 +31,9 @@ pub fn parse_rss_items(xml: &str, source_id: &'static str) -> Vec<SearchResult> 
         let Some(magnet) = build_magnet(&parsed.infohash, &title, &parsed.trackers) else {
             continue;
         };
+        let Some(infohash) = infohash_from_magnet(&magnet) else {
+            continue;
+        };
         out.push(SearchResult {
             magnet,
             title,
@@ -38,6 +41,7 @@ pub fn parse_rss_items(xml: &str, source_id: &'static str) -> Vec<SearchResult> 
             seeders: 0,
             leechers: 0,
             source_id,
+            infohash,
         });
     }
     out

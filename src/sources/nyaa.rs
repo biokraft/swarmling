@@ -1,3 +1,4 @@
+use super::magnet::infohash_from_magnet;
 use super::{build_magnet, SearchResult, Source, SourceError, SourceGroup};
 use crate::util::format::{parse_size, tag, unescape_entities};
 
@@ -52,6 +53,9 @@ impl Source for Nyaa {
             let Some(magnet) = build_magnet(&infohash, &title, &[]) else {
                 continue;
             };
+            let Some(infohash) = infohash_from_magnet(&magnet) else {
+                continue;
+            };
             out.push(SearchResult {
                 magnet,
                 title,
@@ -59,6 +63,7 @@ impl Source for Nyaa {
                 seeders: tag(item, "nyaa:seeders").parse().unwrap_or(0),
                 leechers: tag(item, "nyaa:leechers").parse().unwrap_or(0),
                 source_id: "nyaa",
+                infohash,
             });
         }
         Ok(out)
