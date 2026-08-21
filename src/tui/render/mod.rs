@@ -226,6 +226,7 @@ mod tests {
             added_unix: u64::MAX,
             paused: true,
             source_id: Some("nyaa".into()),
+            dir: None,
         }
     }
 
@@ -495,6 +496,7 @@ mod tests {
             added_unix: 1_700_000_000,
             paused: false,
             source_id: source_id.map(str::to_owned),
+            dir: None,
         }
     }
 

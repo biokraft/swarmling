@@ -88,6 +88,7 @@ mod tests {
         assert_eq!(entries.len(), 1, "the old file was dropped entirely");
         assert_eq!(entries[0].title, "Old");
         assert_eq!(entries[0].source_id, None);
+        assert_eq!(entries[0].dir, None);
 
         // Proof this is not vacuous: the loader really does drop an entry
         // that is missing a field it requires, so the assertion above is
@@ -114,6 +115,7 @@ mod tests {
             added_unix: 42,
             paused: false,
             source_id: None,
+            dir: None,
         }
     }
 

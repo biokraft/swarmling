@@ -169,6 +169,9 @@ async fn main() -> anyhow::Result<()> {
                 paused,
                 // `swarmling add` takes a magnet, not a search result.
                 source_id: None,
+                // The CLI has no per-torrent destination; the default folder
+                // applies.
+                dir: None,
             });
             save_entries(&state_path, &entries)?;
             println!("added {}", parsed.infohash);

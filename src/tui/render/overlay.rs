@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use super::{empty, field_spans, pad, truncate};
+use super::{empty, field_spans, human_size, pad, truncate};
 use crate::tui::app::{App, Overlay};
 use crate::tui::event;
 use crate::tui::layout::centered;
@@ -22,7 +22,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Overlay::Help => help(frame, area),
         Overlay::FolderPrompt => prompt(frame, area, app, " default download folder ", None),
         Overlay::DownloadTo => {
-            let title = app.pending.as_ref().map(|p| p.title.clone());
+            // The spec asks for the name *and* the size: the destination is
+            // being chosen, and how much will land there is part of that.
+            let title = app.pending.as_ref().map(|p| {
+                if p.size_bytes == 0 {
+                    p.title.clone()
+                } else {
+                    format!("{} · {}", p.title, human_size(p.size_bytes))
+                }
+            });
             prompt(frame, area, app, " download to ", title)
         }
     }

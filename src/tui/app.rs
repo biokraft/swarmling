@@ -111,6 +111,9 @@ pub struct Pending {
     pub infohash: String,
     pub magnet: String,
     pub title: String,
+    /// Shown in the prompt so the user can see which torrent they are about
+    /// to put where.
+    pub size_bytes: u64,
     pub source_id: Option<String>,
 }
 
@@ -671,10 +674,16 @@ impl App {
                     self.set_notice("That does not look like a valid magnet link");
                     return Vec::new();
                 };
+                let size_bytes = self
+                    .results
+                    .selected()
+                    .map(|row| row.result.size_bytes)
+                    .unwrap_or(0);
                 self.pending = Some(Pending {
                     infohash: parsed.infohash,
                     magnet,
                     title,
+                    size_bytes,
                     source_id,
                 });
                 self.overlay = Overlay::DownloadTo;
@@ -843,6 +852,7 @@ mod tests {
                 added_unix: 0,
                 paused: false,
                 source_id: None,
+                dir: None,
             }],
         );
         let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=x";
@@ -912,6 +922,7 @@ mod tests {
                 added_unix: 0,
                 paused: false,
                 source_id: None,
+                dir: None,
             }],
         );
         a.update(Action::Key(KeyAction::Enter));
@@ -1129,6 +1140,7 @@ mod tests {
                 added_unix: 0,
                 paused: false,
                 source_id: None,
+                dir: None,
             },
         ]));
         assert_eq!(a.queue.len(), 1);
@@ -1235,22 +1247,18 @@ mod tests {
         // on any key, and the two prompts handed every unknown key to the
         // text field. Ctrl-C in an open prompt did nothing at all. The
         // assertion has to go through App::update to catch that.
-        let states: Vec<(&str, Box<dyn Fn(&mut App)>)> = vec![
-            (
-                "help overlay",
-                Box::new(|a: &mut App| a.overlay = Overlay::Help),
-            ),
-            (
-                "folder prompt",
-                Box::new(|a: &mut App| a.overlay = Overlay::FolderPrompt),
-            ),
-            (
-                "download-to prompt",
-                Box::new(|a: &mut App| a.overlay = Overlay::DownloadTo),
-            ),
-            ("search mode", Box::new(|a: &mut App| a.mode = Mode::Search)),
-            ("filter mode", Box::new(|a: &mut App| a.mode = Mode::Filter)),
-            ("detail view", Box::new(|a: &mut App| a.mode = Mode::Detail)),
+        type SetUp = fn(&mut App);
+        let states: [(&str, SetUp); 6] = [
+            ("help overlay", |a: &mut App| a.overlay = Overlay::Help),
+            ("folder prompt", |a: &mut App| {
+                a.overlay = Overlay::FolderPrompt
+            }),
+            ("download-to prompt", |a: &mut App| {
+                a.overlay = Overlay::DownloadTo
+            }),
+            ("search mode", |a: &mut App| a.mode = Mode::Search),
+            ("filter mode", |a: &mut App| a.mode = Mode::Filter),
+            ("detail view", |a: &mut App| a.mode = Mode::Detail),
         ];
         for (name, set_up) in states {
             let mut app = App::new(PathBuf::from("/tmp"), Vec::new());

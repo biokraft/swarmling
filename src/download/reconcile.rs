@@ -60,6 +60,7 @@ mod tests {
             added_unix: 1,
             paused,
             source_id: None,
+            dir: None,
         }
     }
 

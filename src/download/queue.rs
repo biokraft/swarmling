@@ -20,6 +20,11 @@ pub struct QueueEntry {
     /// existed must still load.
     #[serde(default)]
     pub source_id: Option<String>,
+    /// Where this torrent should land, when the user chose a folder for it
+    /// specifically. `None` means the default download directory.
+    /// `serde(default)` is mandatory: an older queue file must still load.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
 }
 
 /// The list of downloads the user asked for, and the engine that carries them
@@ -107,6 +112,9 @@ impl DownloadQueue {
             // This path takes a bare magnet and knows of no source. The TUI
             // supplies one through `Effect::AddToQueue`.
             source_id: None,
+            // This queue already has one download directory for everything it
+            // holds; a per-entry destination only comes from the TUI's `D`.
+            dir: None,
         });
         Ok(infohash)
     }
@@ -272,6 +280,7 @@ mod tests {
             added_unix: 1,
             paused: true,
             source_id: None,
+            dir: None,
         }];
         let queue = DownloadQueue::with_entries(engine.clone(), PathBuf::from("/d"), restored);
         assert_eq!(queue.entries().len(), 1);

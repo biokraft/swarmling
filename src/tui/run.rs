@@ -158,12 +158,22 @@ fn perform(effect: Effect, app: &App, rt: &mut Runtime) -> Vec<Action> {
             source_id,
         } => {
             // Recorded intent only: this appends to the queue file and starts
-            // no transfer. `dir` is carried for the future daemon; nothing
-            // here creates it or writes into it.
-            let _ = dir;
+            // no transfer. The destination is created and recorded so the
+            // folder the user typed is not silently discarded, but nothing
+            // here writes into it.
             let mut entries = app.queue.clone();
             if entries.iter().any(|e| e.infohash == infohash) {
                 return Vec::new();
+            }
+            let dir = expand_tilde(&dir);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                // A destination that cannot be made is not a queue entry: an
+                // entry pointing at an impossible path would fail later, out
+                // of sight of the person who typed it.
+                return vec![Action::Notice(format!(
+                    "Could not create {} ({e})",
+                    dir.display()
+                ))];
             }
             let added_unix = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -178,6 +188,7 @@ fn perform(effect: Effect, app: &App, rt: &mut Runtime) -> Vec<Action> {
                 // The effect knows which source the row came from;
                 // `DownloadQueue::add` cannot, because it takes a bare magnet.
                 source_id,
+                dir: Some(dir),
             });
             save_queue(entries, rt)
         }
@@ -404,12 +415,13 @@ mod tests {
         let app = App::new(dir.path().to_path_buf(), Vec::new());
         let hash = "a".repeat(40);
 
+        let target = dir.path().join("keep");
         let actions = perform(
             Effect::AddToQueue {
                 infohash: hash.clone(),
                 magnet: format!("magnet:?xt=urn:btih:{hash}"),
                 title: "Example".into(),
-                dir: dir.path().to_path_buf(),
+                dir: target.clone(),
                 source_id: Some("yts".into()),
             },
             &app,
@@ -425,12 +437,57 @@ mod tests {
                     Some("yts"),
                     "the effect's source id must reach the entry, or the source tag stays blank"
                 );
+                assert_eq!(
+                    entries[0].dir.as_deref(),
+                    Some(target.as_path()),
+                    "the folder the user typed at the D prompt must reach the entry"
+                );
             }
             other => panic!("expected one QueueChanged, got {other:?}"),
         }
         let on_disk = load_entries(&queue_path);
         assert_eq!(on_disk.len(), 1, "the queue file was not written");
         assert_eq!(on_disk[0].infohash, hash);
+        assert_eq!(on_disk[0].dir.as_deref(), Some(target.as_path()));
+        assert!(target.is_dir(), "the chosen destination was not created");
+    }
+
+    #[test]
+    fn a_destination_that_cannot_be_made_queues_nothing() {
+        // An entry pointing at an impossible path would fail later, out of
+        // sight of the person who typed it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, b"not a directory").expect("write");
+        let queue_path = dir.path().join("queue.json");
+        let mut rt = Runtime {
+            queue_path: queue_path.clone(),
+            settings_path: dir.path().join("settings.json"),
+            health: HashMap::new(),
+            search: None,
+            quit: false,
+        };
+        let app = App::new(dir.path().to_path_buf(), Vec::new());
+        let hash = "b".repeat(40);
+        let actions = perform(
+            Effect::AddToQueue {
+                infohash: hash.clone(),
+                magnet: format!("magnet:?xt=urn:btih:{hash}"),
+                title: "Example".into(),
+                dir: blocker.join("under"),
+                source_id: None,
+            },
+            &app,
+            &mut rt,
+        );
+        assert!(
+            matches!(actions.as_slice(), [Action::Notice(_)]),
+            "expected a notice, got {actions:?}"
+        );
+        assert!(
+            load_entries(&queue_path).is_empty(),
+            "nothing should have been queued"
+        );
     }
 
     #[test]
