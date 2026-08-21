@@ -62,7 +62,7 @@ swarmling --help                    # everything else
 
 `SWARMLING_DATA_DIR` overrides where the queue and settings are kept, if you want more than one profile.
 
-The terminal UI searches every source, sorts and filters the results, and records what you want downloaded. Like `swarmling add`, it writes that intent to the queue file and nothing more: it transfers no data and contacts no peer. Actually moving bytes waits for the download daemon.
+The terminal UI searches every source, sorts and filters the results, and records what you want downloaded. Like `swarmling add`, it writes that intent to the queue file and nothing more: it transfers no data and contacts no peer. Actually moving bytes waits for a later release.
 
 Search prints one result per line — seeders, size, title, magnet — as each source answers. A source that is down produces a warning on stderr and the search carries on without it.
 
