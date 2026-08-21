@@ -75,6 +75,9 @@ fn help_overlay_key(key: KeyEvent) -> Option<KeyAction> {
 /// Keys bound while browsing (no overlay, not editing): navigation, plus
 /// the section-specific command set.
 fn browsing_key(key: KeyEvent, ctx: Context) -> Option<KeyAction> {
+    if ctx.mode == Mode::Detail {
+        return detail_key(key);
+    }
     if let Some(action) = navigation_key(key) {
         return Some(action);
     }
@@ -84,6 +87,21 @@ fn browsing_key(key: KeyEvent, ctx: Context) -> Option<KeyAction> {
         (KeyModifiers::NONE, KeyCode::Char('o')) => Some(KeyAction::FolderPrompt),
         (KeyModifiers::NONE, KeyCode::Char('q')) => Some(KeyAction::Quit),
         _ => section_key(key, ctx.section),
+    }
+}
+
+/// The detail view: leave it, or act on the torrent it shows. It is not an
+/// editing context, so a plain character is a command, never text.
+fn detail_key(key: KeyEvent) -> Option<KeyAction> {
+    match (key.modifiers, key.code) {
+        (KeyModifiers::NONE, KeyCode::Esc) => Some(KeyAction::Escape),
+        (KeyModifiers::NONE, KeyCode::Enter) => Some(KeyAction::Enter),
+        (KeyModifiers::NONE, KeyCode::Char('d')) => Some(KeyAction::Download),
+        (KeyModifiers::SHIFT, KeyCode::Char('D')) => Some(KeyAction::DownloadTo),
+        (KeyModifiers::NONE, KeyCode::Char('y')) => Some(KeyAction::CopyMagnet),
+        (KeyModifiers::NONE, KeyCode::Char('?')) => Some(KeyAction::Help),
+        (KeyModifiers::NONE, KeyCode::Char('q')) => Some(KeyAction::Quit),
+        _ => None,
     }
 }
 
@@ -97,6 +115,7 @@ fn navigation_key(key: KeyEvent) -> Option<KeyAction> {
         (KeyModifiers::NONE, KeyCode::PageUp) => Some(KeyAction::PageUp),
         (KeyModifiers::NONE, KeyCode::PageDown) => Some(KeyAction::PageDown),
         (KeyModifiers::NONE, KeyCode::Tab) => Some(KeyAction::Tab),
+        (KeyModifiers::NONE, KeyCode::Esc) => Some(KeyAction::Escape),
         (KeyModifiers::NONE, KeyCode::Enter) => Some(KeyAction::Enter),
         _ => None,
     }
@@ -346,5 +365,29 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Esc), ctx), Some(KeyAction::Escape));
         assert_eq!(map_key(key(KeyCode::Char('?')), ctx), Some(KeyAction::Help));
         assert_eq!(map_key(key(KeyCode::Char('d')), ctx), None);
+    }
+
+    #[test]
+    fn detail_mode_is_not_a_text_field() {
+        let ctx = Context {
+            mode: Mode::Detail,
+            ..list()
+        };
+        assert_eq!(
+            map_key(key(KeyCode::Char('d')), ctx),
+            Some(KeyAction::Download),
+            "a plain character in the detail view is a command, not text"
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT), ctx),
+            Some(KeyAction::DownloadTo)
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('y')), ctx),
+            Some(KeyAction::CopyMagnet)
+        );
+        assert_eq!(map_key(key(KeyCode::Esc), ctx), Some(KeyAction::Escape));
+        assert_eq!(map_key(key(KeyCode::Enter), ctx), Some(KeyAction::Enter));
+        assert_eq!(map_key(ctrl('c'), ctx), Some(KeyAction::Quit));
     }
 }

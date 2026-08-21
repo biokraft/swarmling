@@ -76,9 +76,13 @@ pub enum Region {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// The results list (or the queue list) has the keyboard.
     Normal,
     Search,
     Filter,
+    /// One result is shown in full. It consumes its own `Escape`, and any
+    /// event that replaces the list closes it.
+    Detail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,8 +183,18 @@ impl App {
             .unwrap_or(&[])
     }
 
+    /// Leave the detail view. Called whenever the row it shows may no longer
+    /// exist — a new search, a section change, a filter change — because a
+    /// detail view of a vanished torrent is a false display.
+    fn close_detail(&mut self) {
+        if self.mode == Mode::Detail {
+            self.mode = Mode::Normal;
+        }
+    }
+
     /// Move to a section, resetting the view state that belonged to the old one.
     pub fn set_section(&mut self, section: Section) {
+        self.close_detail();
         self.section = section;
         self.results.set_filter("");
         self.results.set_group(section.group());
@@ -261,6 +275,8 @@ impl App {
                 results,
             } => {
                 let groups = self.groups_for(source_id);
+                // The list is being replaced; the detailed row may be gone.
+                self.close_detail();
                 self.results
                     .ingest(source_id, reports_health, groups, results);
                 Vec::new()
@@ -291,13 +307,35 @@ impl App {
         if self.overlay != Overlay::None {
             return self.on_key_overlay(key);
         }
-        // 2. An editing mode routes text keys to the field.
+        // 2. The detail view consumes its own Escape, so it can never also
+        //    move the focus back to the sidebar.
+        if self.mode == Mode::Detail {
+            match key {
+                KeyAction::Escape => {
+                    self.mode = Mode::Normal;
+                    return Vec::new();
+                }
+                // The same row, the same code path, the same effects.
+                KeyAction::Download
+                | KeyAction::DownloadTo
+                | KeyAction::CopyMagnet
+                | KeyAction::Help
+                | KeyAction::Quit
+                // Anything that replaces the list closes the view first.
+                | KeyAction::EditSearch
+                | KeyAction::EditFilter => return self.on_key_normal(key),
+                // Nothing else may move the cursor out from under the view.
+                _ => return Vec::new(),
+            }
+        }
+
+        // 3. An editing mode routes text keys to the field.
         if self.mode == Mode::Search || self.mode == Mode::Filter {
             if let Some(effects) = self.on_key_editing(&key) {
                 return effects;
             }
         }
-        // 3. Region and section commands.
+        // 4. Region and section commands.
         self.on_key_normal(key)
     }
 
@@ -425,6 +463,7 @@ impl App {
             return Vec::new();
         }
         let raw = self.field.value().trim().to_owned();
+        self.close_detail();
         self.mode = Mode::Normal;
         self.screen = Screen::Browser;
         if raw.is_empty() {
@@ -546,16 +585,24 @@ impl App {
                 if self.region == Region::Sidebar {
                     self.region = Region::Content;
                     Vec::new()
+                } else if self.section == Section::Downloads {
+                    Vec::new()
                 } else {
-                    self.download_selected(None)
+                    // A row must exist before there is anything to detail.
+                    if self.results.selected().is_some() {
+                        self.mode = Mode::Detail;
+                    }
+                    Vec::new()
                 }
             }
             KeyAction::EditSearch => {
+                self.close_detail();
                 self.mode = Mode::Search;
                 self.field.set_value(&self.query.clone());
                 Vec::new()
             }
             KeyAction::EditFilter => {
+                self.close_detail();
                 self.mode = Mode::Filter;
                 let current = self.results.filter().to_owned();
                 self.field.set_value(&current);
@@ -1013,5 +1060,97 @@ mod tests {
         a.update(Action::QueueChanged(Vec::new()));
         assert_eq!(a.queue.len(), 0);
         assert_eq!(a.queue_cursor, 0);
+    }
+
+    #[test]
+    fn enter_on_a_result_opens_the_detail_view() {
+        let mut a = browsing_with_one_result();
+        let effects = a.update(Action::Key(KeyAction::Enter));
+        assert!(
+            effects.is_empty(),
+            "opening a detail view is not a download"
+        );
+        assert_eq!(a.mode, Mode::Detail);
+    }
+
+    #[test]
+    fn enter_with_nothing_selected_does_not_open_a_detail_view() {
+        let mut a = app();
+        a.update(Action::Key(KeyAction::Insert("ubuntu".into())));
+        a.update(Action::Key(KeyAction::Enter));
+        a.region = Region::Content;
+        assert!(a.results.selected().is_none());
+        let effects = a.update(Action::Key(KeyAction::Enter));
+        assert!(effects.is_empty());
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn escape_leaves_the_detail_view_without_leaving_the_content_region() {
+        let mut a = browsing_with_one_result();
+        a.update(Action::Key(KeyAction::Enter));
+        assert_eq!(a.mode, Mode::Detail);
+        a.update(Action::Key(KeyAction::Escape));
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(
+            a.region,
+            Region::Content,
+            "the detail view consumes its own Escape; it must not also move focus"
+        );
+    }
+
+    #[test]
+    fn downloading_from_the_detail_view_produces_the_same_effect_as_from_the_list() {
+        let mut from_list = browsing_with_one_result();
+        let listed = from_list.update(Action::Key(KeyAction::Download));
+
+        let mut from_detail = browsing_with_one_result();
+        from_detail.update(Action::Key(KeyAction::Enter));
+        let detailed = from_detail.update(Action::Key(KeyAction::Download));
+
+        assert_eq!(listed, detailed);
+        assert!(!listed.is_empty());
+
+        let mut copying = browsing_with_one_result();
+        copying.update(Action::Key(KeyAction::Enter));
+        assert!(matches!(
+            copying
+                .update(Action::Key(KeyAction::CopyMagnet))
+                .as_slice(),
+            [Effect::CopyToClipboard(_)]
+        ));
+    }
+
+    #[test]
+    fn a_new_search_closes_a_stale_detail_view() {
+        let mut a = browsing_with_one_result();
+        a.update(Action::Key(KeyAction::Enter));
+        assert_eq!(a.mode, Mode::Detail);
+        a.update(Action::SearchResults {
+            source_id: "nyaa",
+            reports_health: true,
+            results: vec![row(
+                "magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef&dn=y",
+                "a different torrent",
+            )],
+        });
+        assert_eq!(
+            a.mode,
+            Mode::Normal,
+            "a detail view of a row that may be gone is a false display"
+        );
+    }
+
+    #[test]
+    fn changing_the_section_or_the_filter_closes_the_detail_view() {
+        let mut a = browsing_with_one_result();
+        a.update(Action::Key(KeyAction::Enter));
+        a.set_section(Section::Games);
+        assert_eq!(a.mode, Mode::Normal);
+
+        let mut b = browsing_with_one_result();
+        b.update(Action::Key(KeyAction::Enter));
+        b.update(Action::Key(KeyAction::EditFilter));
+        assert_eq!(b.mode, Mode::Filter);
     }
 }
