@@ -99,7 +99,9 @@ fn browsing_key(key: KeyEvent, ctx: Context) -> Option<KeyAction> {
 fn detail_key(key: KeyEvent) -> Option<KeyAction> {
     match (key.modifiers, key.code) {
         (KeyModifiers::NONE, KeyCode::Esc) => Some(KeyAction::Escape),
-        (KeyModifiers::NONE, KeyCode::Enter) => Some(KeyAction::Enter),
+        // Enter is deliberately unbound here: the detail view is already the
+        // opened row, and the App does not forward it. A key that maps to an
+        // action nothing handles is a dead key that looks alive.
         (KeyModifiers::NONE, KeyCode::Char('d')) => Some(KeyAction::Download),
         (KeyModifiers::SHIFT, KeyCode::Char('D')) => Some(KeyAction::DownloadTo),
         (KeyModifiers::NONE, KeyCode::Char('y')) => Some(KeyAction::CopyMagnet),
@@ -681,7 +683,11 @@ mod tests {
             Some(KeyAction::CopyMagnet)
         );
         assert_eq!(map_key(key(KeyCode::Esc), ctx), Some(KeyAction::Escape));
-        assert_eq!(map_key(key(KeyCode::Enter), ctx), Some(KeyAction::Enter));
+        assert_eq!(
+            map_key(key(KeyCode::Enter), ctx),
+            None,
+            "the detail view is already the opened row; the App handles no Enter there"
+        );
         assert_eq!(map_key(ctrl('c'), ctx), Some(KeyAction::Quit));
     }
 

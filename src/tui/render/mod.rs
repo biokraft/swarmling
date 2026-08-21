@@ -535,7 +535,7 @@ mod tests {
         let text = downloads_screen(queue_entry("queued release", None));
         assert!(text.contains("queued release"), "{text}");
         assert!(
-            text.contains("queued — start downloads with the daemon"),
+            text.contains("queued — downloads start in a later release"),
             "the read-only state is not explained: {text}"
         );
         assert!(

@@ -14,7 +14,7 @@ use crate::tui::layout::window_start;
 use crate::tui::theme::{icon, source_tag, ACCENT, ALT, BRIGHT, RULE, TEXT, WARN};
 
 const CURSOR_BG: Color = Color::Rgb(0x2a, 0x22, 0x3d);
-const EXPLAINER: &str = "queued — start downloads with the daemon";
+const EXPLAINER: &str = "queued — downloads start in a later release";
 
 /// Each entry takes a title row and a detail row.
 const ROW_HEIGHT: usize = 2;
