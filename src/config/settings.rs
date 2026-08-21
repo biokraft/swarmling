@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     pub vpn_required: bool,
     pub vpn_adapter: String,
+    /// The folder new downloads are recorded against. `None` means "whatever
+    /// the platform calls Downloads today", resolved at startup. Optional so
+    /// a settings file written before this field existed still loads.
+    #[serde(default)]
+    pub download_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Settings {
@@ -14,6 +19,7 @@ impl Default for Settings {
         Self {
             vpn_required: false,
             vpn_adapter: "generic".into(),
+            download_dir: None,
         }
     }
 }
@@ -107,6 +113,7 @@ mod tests {
         let s = Settings::default();
         assert!(!s.vpn_required);
         assert_eq!(s.vpn_adapter, "generic");
+        assert_eq!(s.download_dir, None);
     }
 
     #[test]
@@ -116,6 +123,7 @@ mod tests {
         let s = Settings {
             vpn_required: true,
             vpn_adapter: "nordvpn".into(),
+            download_dir: Some(dir.path().join("torrents")),
         };
         save(&path, &s).unwrap();
         assert_eq!(load(&path), s);
