@@ -5,12 +5,15 @@ use swarmling::sources::registry::all_sources;
 #[derive(Parser)]
 #[command(name = "swarmling", version, about = "Terminal torrent finder")]
 struct Cli {
+    /// With no subcommand, swarmling launches the terminal UI.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Launch the terminal UI
+    Tui,
     /// Search all sources and print results
     Search { query: String },
     /// Add a magnet link to the download queue
@@ -61,7 +64,14 @@ fn human_size(bytes: u64) -> String {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    // With no subcommand, and with `tui`, swarmling launches the terminal UI.
+    // It performs its queue effects against the queue file, exactly as `add`
+    // does below; it constructs no session either.
+    let Some(command) = cli.command else {
+        return swarmling::tui::run::run().await;
+    };
+    match command {
+        Command::Tui => swarmling::tui::run::run().await?,
         Command::Search { query } => {
             let mut rx = search_all(all_sources(), &query).await;
             while let Some(ev) = rx.recv().await {

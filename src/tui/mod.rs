@@ -4,6 +4,7 @@ pub mod event;
 pub mod layout;
 pub mod render;
 pub mod results;
+pub mod run;
 pub mod textfield;
 pub mod theme;
 pub mod wordmark;

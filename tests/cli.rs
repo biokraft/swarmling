@@ -182,3 +182,19 @@ fn add_is_not_blocked_when_the_vpn_requirement_is_off() {
         .success()
         .stdout(predicate::str::contains("added"));
 }
+
+#[test]
+fn help_lists_the_tui_subcommand() {
+    // The TUI is reachable by name as well as by running swarmling bare;
+    // a subcommand missing from --help is a feature the user cannot find.
+    let out = Command::cargo_bin("swarmling")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("tui"),
+        "missing tui subcommand in help:\n{stdout}"
+    );
+}

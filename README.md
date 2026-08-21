@@ -48,6 +48,8 @@ Planned once the rewrite lands: `cargo install swarmling`, `brew install biokraf
 ## Use it
 
 ```sh
+swarmling                           # launch the terminal UI
+swarmling tui                       # the same, by name
 swarmling search "ubuntu 24.04"     # search every source at once
 swarmling add "<magnet>"            # queue a download (records intent)
 swarmling add "<magnet>" --paused   # queue it without starting it
@@ -59,6 +61,8 @@ swarmling --help                    # everything else
 ```
 
 `SWARMLING_DATA_DIR` overrides where the queue and settings are kept, if you want more than one profile.
+
+The terminal UI searches every source, sorts and filters the results, and records what you want downloaded. Like `swarmling add`, it writes that intent to the queue file and nothing more: it transfers no data and contacts no peer. Actually moving bytes waits for the download daemon.
 
 Search prints one result per line — seeders, size, title, magnet — as each source answers. A source that is down produces a warning on stderr and the search carries on without it.
 
