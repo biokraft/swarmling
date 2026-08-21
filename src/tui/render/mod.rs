@@ -191,30 +191,127 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_tiny_browser_with_content_renders_without_panicking() {
-        for (w, h) in [(1, 1), (2, 2), (10, 5), (20, 11), (40, 17), (80, 24)] {
-            let mut a = app();
+    /// Sizes a terminal really gets resized to, degenerate ones included.
+    const SIZES: [(u16, u16); 9] = [
+        (1, 1),
+        (2, 2),
+        (3, 1),
+        (10, 5),
+        (20, 11),
+        (40, 17),
+        (80, 24),
+        (120, 40),
+        (200, 3),
+    ];
+
+    /// A row built to break a careless renderer: a multi-byte CJK title and
+    /// the largest size a u64 can hold.
+    fn hostile_result() -> crate::sources::SearchResult {
+        crate::sources::SearchResult {
+            title: "進撃の巨人 — 第四期 完結編 [1080p][HEVC][マルチ音声]".into(),
+            magnet: "magnet:?xt=urn:btih:".to_owned() + &"cd".repeat(20),
+            size_bytes: u64::MAX,
+            seeders: u32::MAX,
+            leechers: u32::MAX,
+            source_id: "nyaa",
+            infohash: "cd".repeat(20),
+        }
+    }
+
+    fn hostile_entry() -> crate::download::queue::QueueEntry {
+        crate::download::queue::QueueEntry {
+            infohash: "cd".repeat(20),
+            magnet: "magnet:?xt=urn:btih:".to_owned() + &"cd".repeat(20),
+            title: "進撃の巨人 — 第四期 完結編".into(),
+            added_unix: u64::MAX,
+            paused: true,
+            source_id: Some("nyaa".into()),
+        }
+    }
+
+    /// Every screen the app can be showing, each with hostile content.
+    fn every_screen() -> Vec<(&'static str, App)> {
+        let populated = || {
+            let mut a = App::new(
+                std::path::PathBuf::from("/tmp/x"),
+                vec![hostile_entry(), hostile_entry()],
+            );
             a.update(Action::Key(KeyAction::Enter));
             a.update(Action::SearchResults {
-                source_id: "yts",
+                source_id: "nyaa",
                 reports_health: true,
-                results: vec![crate::sources::SearchResult {
-                    title: "a very long release title that will not fit anywhere".into(),
-                    magnet: "magnet:?xt=urn:btih:".to_owned() + &"ab".repeat(20),
-                    size_bytes: 1,
-                    seeders: 1,
-                    leechers: 0,
-                    source_id: "yts",
-                    infohash: "ab".repeat(20),
-                }],
+                results: vec![hostile_result()],
             });
-            let _ = render(&a, w, h);
-            a.update(Action::Key(KeyAction::Enter));
-            let _ = render(&a, w, h);
-            a.update(Action::Key(KeyAction::Help));
-            let _ = render(&a, w, h);
+            a.update(Action::SearchFailed {
+                source_id: "yts",
+                error: "timed out".into(),
+            });
+            a.region = Region::Content;
+            a
+        };
+
+        let mut screens: Vec<(&'static str, App)> = Vec::new();
+        screens.push(("splash", app()));
+
+        let mut splash_typed = app();
+        splash_typed.update(Action::Key(KeyAction::Insert(
+            "進撃の巨人 a very long query".into(),
+        )));
+        screens.push(("splash with a query", splash_typed));
+
+        screens.push(("results", populated()));
+
+        let mut downloads = populated();
+        downloads.set_section(crate::tui::app::Section::Downloads);
+        screens.push(("downloads", downloads));
+
+        let mut empty_downloads = app();
+        empty_downloads.update(Action::Key(KeyAction::Enter));
+        empty_downloads.set_section(crate::tui::app::Section::Downloads);
+        screens.push(("empty downloads", empty_downloads));
+
+        let mut detail = populated();
+        detail.update(Action::Key(KeyAction::Enter));
+        screens.push(("detail", detail));
+
+        let mut help = populated();
+        help.update(Action::Key(KeyAction::Help));
+        screens.push(("help overlay", help));
+
+        let mut folder = populated();
+        folder.update(Action::Key(KeyAction::FolderPrompt));
+        screens.push(("folder prompt", folder));
+
+        let mut download_to = populated();
+        download_to.update(Action::Key(KeyAction::DownloadTo));
+        screens.push(("download-to prompt", download_to));
+
+        screens
+    }
+
+    #[test]
+    fn every_screen_renders_at_every_size_without_panicking() {
+        // Terminals get resized to absurd sizes mid-session, and a panic here
+        // leaves the user's terminal in raw mode. Every screen is covered,
+        // not only the ones that are easy to reach.
+        for (_name, app) in every_screen() {
+            for (w, h) in SIZES {
+                let _ = render(&app, w, h);
+            }
         }
+    }
+
+    #[test]
+    fn every_screen_is_reachable_and_really_differs() {
+        // Guards the sweep above: if a screen constructor silently failed to
+        // change the app, the sweep would be testing the same screen twice.
+        let screens = every_screen();
+        assert_eq!(screens.len(), 9);
+        let rendered: std::collections::HashSet<String> = screens
+            .iter()
+            .map(|(_, a)| text_of(&render(a, 100, 30)))
+            .collect();
+        assert_eq!(rendered.len(), 9, "two screens rendered identically");
     }
 
     #[test]
