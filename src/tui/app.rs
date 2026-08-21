@@ -437,6 +437,17 @@ impl App {
         }
         match key {
             KeyAction::Enter => Some(self.submit_field()),
+            // On the splash, Tab means "browse without searching": it
+            // submits the field exactly as Enter does, so an empty field
+            // opens the browser. In the browser's own search or filter box
+            // it is swallowed rather than shifting the focus mid-edit.
+            KeyAction::Tab => {
+                if self.screen == Screen::Splash && self.mode == Mode::Search {
+                    Some(self.submit_field())
+                } else {
+                    Some(Vec::new())
+                }
+            }
             KeyAction::Escape => {
                 if self.mode == Mode::Filter {
                     self.results.set_filter("");
@@ -697,6 +708,40 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_on_the_splash_browses_without_searching() {
+        // The splash advertises "⇥ browse". Tab submits the field the same
+        // way Enter does, so an empty field opens the browser and starts no
+        // search at all.
+        let mut app = App::new(std::path::PathBuf::from("/tmp/x"), Vec::new());
+        assert_eq!(app.screen, Screen::Splash);
+        let effects = app.update(Action::Key(KeyAction::Tab));
+        assert_eq!(app.screen, Screen::Browser);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(effects.is_empty(), "an empty field must start no search");
+        assert!(!app.searching);
+    }
+
+    #[test]
+    fn tab_on_the_splash_runs_a_typed_query_like_enter() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/x"), Vec::new());
+        app.update(Action::Key(KeyAction::Insert("ubuntu".into())));
+        let effects = app.update(Action::Key(KeyAction::Tab));
+        assert_eq!(effects, vec![Effect::StartSearch("ubuntu".into())]);
+    }
+
+    #[test]
+    fn tab_does_not_shift_the_focus_out_of_the_browser_search_box() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/x"), Vec::new());
+        app.update(Action::Key(KeyAction::Enter));
+        app.update(Action::Key(KeyAction::EditSearch));
+        assert_eq!(app.mode, Mode::Search);
+        let region = app.region;
+        app.update(Action::Key(KeyAction::Tab));
+        assert_eq!(app.mode, Mode::Search, "the search box lost the keyboard");
+        assert_eq!(app.region, region);
+    }
 
     fn app() -> App {
         App::new(

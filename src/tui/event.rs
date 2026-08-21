@@ -48,6 +48,10 @@ fn editing_key(key: KeyEvent) -> Option<KeyAction> {
         (KeyModifiers::NONE, KeyCode::Right) => Some(KeyAction::Right),
         (KeyModifiers::NONE, KeyCode::Enter) => Some(KeyAction::Enter),
         (KeyModifiers::NONE, KeyCode::Esc) => Some(KeyAction::Escape),
+        // Tab leaves the field rather than typing into it. On the splash the
+        // app reads it as "browse without searching"; elsewhere it is
+        // swallowed so it cannot move the focus mid-edit.
+        (KeyModifiers::NONE, KeyCode::Tab) => Some(KeyAction::Tab),
 
         // Plain text: only NONE or SHIFT may reach the buffer. Anything else
         // unbound here (e.g. Alt, or a stray control character) falls
@@ -576,6 +580,13 @@ mod tests {
             map_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT), ctx),
             Some(KeyAction::ClearQueue)
         );
+    }
+
+    #[test]
+    fn tab_leaves_the_field_instead_of_typing_into_it() {
+        // The splash hint promises "⇥ browse"; without this binding the key
+        // is dead and the hint is a lie.
+        assert_eq!(map_key(key(KeyCode::Tab), editing()), Some(KeyAction::Tab));
     }
 
     #[test]
