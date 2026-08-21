@@ -242,8 +242,45 @@ fn save_queue(entries: Vec<QueueEntry>, rt: &Runtime) -> Vec<Action> {
     }
 }
 
-fn copy_to_clipboard(text: &str) -> Result<(), arboard::Error> {
-    arboard::Clipboard::new()?.set_text(text.to_owned())
+/// macOS and Windows keep the clipboard in the system, so setting it and
+/// dropping the handle is enough.
+#[cfg(not(target_os = "linux"))]
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard
+        .set_text(text.to_owned())
+        .map_err(|e| e.to_string())
+}
+
+/// On X11 and Wayland the clipboard lives in the process that owns the
+/// selection: dropping the handle releases it, and the paste comes back
+/// empty. `SetExtLinux::wait` keeps serving requests until another
+/// application takes the selection over, which cannot happen on the event
+/// loop — so a detached thread owns a clipboard of its own for as long as
+/// anyone wants the text.
+///
+/// A handle is opened here first, and dropped again, purely so that a machine
+/// with no display server reports the failure to the user straight away
+/// rather than failing silently inside the thread. The thread builds its own,
+/// which also means nothing has to be `Send`.
+#[cfg(target_os = "linux")]
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use arboard::SetExtLinux;
+
+    drop(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+    let text = text.to_owned();
+    std::thread::Builder::new()
+        .name("swarmling-clipboard".into())
+        .spawn(move || {
+            // The UI has already been told the copy succeeded; there is
+            // nobody left to tell if the selection is taken over later.
+            let Ok(mut clipboard) = arboard::Clipboard::new() else {
+                return;
+            };
+            let _ = clipboard.set().wait().text(text);
+        })
+        .map_err(|e| format!("could not hold the clipboard ({e})"))?;
+    Ok(())
 }
 
 /// Feed one action to the app and perform whatever it asks for, until the
