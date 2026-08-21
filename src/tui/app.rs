@@ -311,6 +311,13 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyAction) -> Vec<Effect> {
+        // 0. Quit is handled before anything else can swallow it. There must
+        //    be no state the user can get stuck in, and both prompts route
+        //    unknown keys into the text field.
+        if key == KeyAction::Quit {
+            self.should_quit = true;
+            return vec![Effect::Quit];
+        }
         // 1. An open overlay consumes the key.
         if self.overlay != Overlay::None {
             return self.on_key_overlay(key);
@@ -1220,5 +1227,37 @@ mod tests {
         b.update(Action::Key(KeyAction::Enter));
         b.update(Action::Key(KeyAction::EditFilter));
         assert_eq!(b.mode, Mode::Filter);
+    }
+    #[test]
+    fn quit_is_reachable_from_every_overlay_and_mode() {
+        // map_key already produces Quit everywhere and a mapper-level test
+        // asserted it — but the App swallowed it: the help overlay dismissed
+        // on any key, and the two prompts handed every unknown key to the
+        // text field. Ctrl-C in an open prompt did nothing at all. The
+        // assertion has to go through App::update to catch that.
+        let states: Vec<(&str, Box<dyn Fn(&mut App)>)> = vec![
+            (
+                "help overlay",
+                Box::new(|a: &mut App| a.overlay = Overlay::Help),
+            ),
+            (
+                "folder prompt",
+                Box::new(|a: &mut App| a.overlay = Overlay::FolderPrompt),
+            ),
+            (
+                "download-to prompt",
+                Box::new(|a: &mut App| a.overlay = Overlay::DownloadTo),
+            ),
+            ("search mode", Box::new(|a: &mut App| a.mode = Mode::Search)),
+            ("filter mode", Box::new(|a: &mut App| a.mode = Mode::Filter)),
+            ("detail view", Box::new(|a: &mut App| a.mode = Mode::Detail)),
+        ];
+        for (name, set_up) in states {
+            let mut app = App::new(PathBuf::from("/tmp"), Vec::new());
+            set_up(&mut app);
+            let effects = app.update(Action::Key(KeyAction::Quit));
+            assert!(app.should_quit, "{name}: quit was swallowed");
+            assert_eq!(effects, vec![Effect::Quit], "{name}");
+        }
     }
 }
