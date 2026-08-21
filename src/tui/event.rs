@@ -390,4 +390,21 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Enter), ctx), Some(KeyAction::Enter));
         assert_eq!(map_key(ctrl('c'), ctx), Some(KeyAction::Quit));
     }
+
+    #[test]
+    fn esc_is_reachable_in_plain_browsing_not_only_in_overlays_and_detail() {
+        // This binding was missing entirely once: the App handled Escape but
+        // no key produced it, so the whole region walk-back was dead from the
+        // keyboard while every test still passed. The app-side tests
+        // construct KeyAction::Escape directly and would not catch it, so
+        // this one goes through map_key deliberately.
+        let ctx = list();
+        assert_eq!(map_key(key(KeyCode::Esc), ctx), Some(KeyAction::Escape));
+
+        let sidebar = Context {
+            region: Region::Sidebar,
+            ..ctx
+        };
+        assert_eq!(map_key(key(KeyCode::Esc), sidebar), Some(KeyAction::Escape));
+    }
 }
