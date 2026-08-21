@@ -111,6 +111,7 @@ pub struct Pending {
     pub infohash: String,
     pub magnet: String,
     pub title: String,
+    pub source_id: Option<String>,
 }
 
 pub struct App {
@@ -210,7 +211,13 @@ impl App {
     }
 
     /// Record the intent to download a magnet. Never starts a transfer.
-    fn queue_magnet(&mut self, magnet: &str, title: Option<&str>, dir: PathBuf) -> Vec<Effect> {
+    fn queue_magnet(
+        &mut self,
+        magnet: &str,
+        title: Option<&str>,
+        dir: PathBuf,
+        source_id: Option<String>,
+    ) -> Vec<Effect> {
         let Some(parsed) = parse_magnet(magnet) else {
             self.set_notice("That does not look like a valid magnet link");
             return Vec::new();
@@ -238,6 +245,7 @@ impl App {
             magnet: magnet.to_owned(),
             title,
             dir,
+            source_id,
         }]
     }
 
@@ -389,7 +397,12 @@ impl App {
                     }
                     // A per-torrent destination is not the new default.
                     self.last_download_to = Some(dir.clone());
-                    let effects = self.queue_magnet(&pending.magnet, Some(&pending.title), dir);
+                    let effects = self.queue_magnet(
+                        &pending.magnet,
+                        Some(&pending.title),
+                        dir,
+                        pending.source_id,
+                    );
                     if !effects.is_empty() {
                         self.set_section(Section::Downloads);
                         self.region = Region::Content;
@@ -485,7 +498,8 @@ impl App {
         if parse_magnet(&raw).is_some() {
             self.field.clear();
             let dir = self.download_dir.clone();
-            let effects = self.queue_magnet(&raw, None, dir);
+            // A pasted magnet came from no source.
+            let effects = self.queue_magnet(&raw, None, dir, None);
             self.set_section(Section::Downloads);
             self.region = Region::Content;
             return effects;
@@ -535,10 +549,15 @@ impl App {
         }
     }
 
-    fn selected_magnet(&self) -> Option<(String, String)> {
-        self.results
-            .selected()
-            .map(|row| (row.result.magnet.clone(), row.result.title.clone()))
+    /// The selected row's magnet, title, and the source it came from.
+    fn selected_magnet(&self) -> Option<(String, String, Option<String>)> {
+        self.results.selected().map(|row| {
+            (
+                row.result.magnet.clone(),
+                row.result.title.clone(),
+                Some(row.result.source_id.to_owned()),
+            )
+        })
     }
 
     fn on_key_normal(&mut self, key: KeyAction) -> Vec<Effect> {
@@ -638,7 +657,7 @@ impl App {
                 Vec::new()
             }
             KeyAction::DownloadTo => {
-                let Some((magnet, title)) = self.selected_magnet() else {
+                let Some((magnet, title, source_id)) = self.selected_magnet() else {
                     return Vec::new();
                 };
                 let Some(parsed) = parse_magnet(&magnet) else {
@@ -649,6 +668,7 @@ impl App {
                     infohash: parsed.infohash,
                     magnet,
                     title,
+                    source_id,
                 });
                 self.overlay = Overlay::DownloadTo;
                 let prefill = self
@@ -660,7 +680,7 @@ impl App {
                 Vec::new()
             }
             KeyAction::CopyMagnet => match self.selected_magnet() {
-                Some((magnet, _)) => {
+                Some((magnet, _, _)) => {
                     self.set_notice("Magnet copied");
                     vec![Effect::CopyToClipboard(magnet)]
                 }
@@ -697,11 +717,11 @@ impl App {
     }
 
     fn download_selected(&mut self, dir: Option<PathBuf>) -> Vec<Effect> {
-        let Some((magnet, title)) = self.selected_magnet() else {
+        let Some((magnet, title, source_id)) = self.selected_magnet() else {
             return Vec::new();
         };
         let dir = dir.unwrap_or_else(|| self.download_dir.clone());
-        self.queue_magnet(&magnet, Some(&title), dir)
+        self.queue_magnet(&magnet, Some(&title), dir, source_id)
     }
 }
 
@@ -815,6 +835,7 @@ mod tests {
                 title: "already here".into(),
                 added_unix: 0,
                 paused: false,
+                source_id: None,
             }],
         );
         let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=x";
@@ -883,6 +904,7 @@ mod tests {
                 title: "t".into(),
                 added_unix: 0,
                 paused: false,
+                source_id: None,
             }],
         );
         a.update(Action::Key(KeyAction::Enter));
@@ -1099,6 +1121,7 @@ mod tests {
                 title: "t".into(),
                 added_unix: 0,
                 paused: false,
+                source_id: None,
             },
         ]));
         assert_eq!(a.queue.len(), 1);

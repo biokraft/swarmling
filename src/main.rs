@@ -157,6 +157,8 @@ async fn main() -> anyhow::Result<()> {
                 title,
                 added_unix: now,
                 paused,
+                // `swarmling add` takes a magnet, not a search result.
+                source_id: None,
             });
             save_entries(&state_path, &entries)?;
             println!("added {}", parsed.infohash);

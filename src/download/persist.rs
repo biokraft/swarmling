@@ -73,6 +73,39 @@ mod tests {
     use super::*;
     use crate::download::queue::QueueEntry;
 
+    #[test]
+    fn a_queue_file_written_before_source_id_existed_still_loads() {
+        // The project rule: an older state file must keep working. There are
+        // queue files in the wild with no `source_id` key at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("queue.json");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"entries":[{"infohash":"aa","magnet":"magnet:?xt=urn:btih:aa","title":"Old","added_unix":7,"paused":false}]}"#,
+        )
+        .expect("write");
+        let entries = load_entries(&path);
+        assert_eq!(entries.len(), 1, "the old file was dropped entirely");
+        assert_eq!(entries[0].title, "Old");
+        assert_eq!(entries[0].source_id, None);
+
+        // Proof this is not vacuous: the loader really does drop an entry
+        // that is missing a field it requires, so the assertion above is
+        // load-bearing. (`Option` fields are optional to serde whether or
+        // not `serde(default)` is present; the attribute states the intent
+        // and survives the field's type changing.)
+        let required = dir.path().join("required.json");
+        std::fs::write(
+            &required,
+            br#"{"version":1,"entries":[{"infohash":"aa","magnet":"magnet:?xt=urn:btih:aa","added_unix":7,"paused":false}]}"#,
+        )
+        .expect("write");
+        assert!(
+            load_entries(&required).is_empty(),
+            "an entry missing a required field should be skipped"
+        );
+    }
+
     fn entry(hash: &str) -> QueueEntry {
         QueueEntry {
             infohash: hash.into(),
@@ -80,6 +113,7 @@ mod tests {
             title: "Example".into(),
             added_unix: 42,
             paused: false,
+            source_id: None,
         }
     }
 

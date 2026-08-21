@@ -14,6 +14,12 @@ pub struct QueueEntry {
     pub title: String,
     pub added_unix: u64,
     pub paused: bool,
+    /// Which source the torrent was found through, when it was found by
+    /// searching. `None` for a magnet the user pasted, which has no source.
+    /// `serde(default)` is mandatory: a queue file written before this field
+    /// existed must still load.
+    #[serde(default)]
+    pub source_id: Option<String>,
 }
 
 /// The list of downloads the user asked for, and the engine that carries them
@@ -98,6 +104,9 @@ impl DownloadQueue {
             title: title.to_string(),
             added_unix: now_unix(),
             paused,
+            // This path takes a bare magnet and knows of no source. The TUI
+            // supplies one through `Effect::AddToQueue`.
+            source_id: None,
         });
         Ok(infohash)
     }
@@ -262,6 +271,7 @@ mod tests {
             title: "A".into(),
             added_unix: 1,
             paused: true,
+            source_id: None,
         }];
         let queue = DownloadQueue::with_entries(engine.clone(), PathBuf::from("/d"), restored);
         assert_eq!(queue.entries().len(), 1);

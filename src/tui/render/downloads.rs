@@ -68,9 +68,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(truncate(&entry.title, width.saturating_sub(2)), title_style),
         ]));
 
-        // The queue records no source id, so the tag falls back to the
-        // neutral marker rather than guessing one from the magnet.
-        let (tag, tag_colour) = source_tag(&entry.infohash);
+        // A pasted magnet came from no source, so it has no tag to show;
+        // `source_tag` gives the neutral marker for that case.
+        let (tag, tag_colour) = source_tag(entry.source_id.as_deref().unwrap_or(""));
         let mut detail = vec![
             Span::raw("  "),
             Span::styled(format!("{tag} "), Style::default().fg(tag_colour)),

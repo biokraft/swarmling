@@ -59,6 +59,7 @@ mod tests {
             title: "Example".into(),
             added_unix: 1,
             paused,
+            source_id: None,
         }
     }
 

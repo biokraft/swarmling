@@ -87,6 +87,9 @@ pub enum Effect {
         magnet: String,
         title: String,
         dir: PathBuf,
+        /// The source the torrent was found through, so the queue can show
+        /// where it came from. `None` for a pasted magnet.
+        source_id: Option<String>,
     },
     RemoveFromQueue(String),
     ClearQueue,

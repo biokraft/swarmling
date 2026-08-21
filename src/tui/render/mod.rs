@@ -390,21 +390,50 @@ mod tests {
         assert!(text.contains("copy"), "no action line: {text}");
     }
 
+    fn queue_entry(title: &str, source_id: Option<&str>) -> crate::download::queue::QueueEntry {
+        crate::download::queue::QueueEntry {
+            infohash: "ab".repeat(20),
+            magnet: "magnet:?xt=urn:btih:".to_owned() + &"ab".repeat(20),
+            title: title.to_owned(),
+            added_unix: 1_700_000_000,
+            paused: false,
+            source_id: source_id.map(str::to_owned),
+        }
+    }
+
+    fn downloads_screen(entry: crate::download::queue::QueueEntry) -> String {
+        let mut a = App::new(std::path::PathBuf::from("/tmp/x"), vec![entry]);
+        a.update(Action::Key(KeyAction::Enter));
+        a.set_section(crate::tui::app::Section::Downloads);
+        text_of(&render(&a, 100, 30))
+    }
+
+    #[test]
+    fn a_queue_entry_shows_the_source_it_was_found_through() {
+        let text = downloads_screen(queue_entry("found by searching", Some("nyaa")));
+        assert!(text.contains("NYAA"), "the source tag is missing: {text}");
+    }
+
+    #[test]
+    fn a_pasted_magnet_shows_the_neutral_tag_rather_than_an_invented_source() {
+        let text = downloads_screen(queue_entry("pasted magnet", None));
+        assert!(text.contains("pasted magnet"), "{text}");
+        for (tag, _) in ["nyaa", "yts", "eztv", "fitgirl"]
+            .iter()
+            .map(|id| crate::tui::theme::source_tag(id))
+        {
+            assert!(
+                !text.contains(tag),
+                "an unrelated source tag appeared: {text}"
+            );
+        }
+    }
+
     #[test]
     fn the_downloads_panel_says_nothing_is_transferring() {
         // There is no session in this milestone. A progress bar would be a
         // lie, so the panel has to say why nothing is moving.
-        let entry = crate::download::queue::QueueEntry {
-            infohash: "ab".repeat(20),
-            magnet: "magnet:?xt=urn:btih:".to_owned() + &"ab".repeat(20),
-            title: "queued release".into(),
-            added_unix: 1_700_000_000,
-            paused: false,
-        };
-        let mut a = App::new(std::path::PathBuf::from("/tmp/x"), vec![entry]);
-        a.update(Action::Key(KeyAction::Enter));
-        a.set_section(crate::tui::app::Section::Downloads);
-        let text = text_of(&render(&a, 100, 30));
+        let text = downloads_screen(queue_entry("queued release", None));
         assert!(text.contains("queued release"), "{text}");
         assert!(
             text.contains("queued — start downloads with the daemon"),
