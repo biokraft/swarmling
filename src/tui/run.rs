@@ -208,6 +208,15 @@ fn perform(effect: Effect, app: &App, rt: &mut Runtime) -> Vec<Action> {
         },
 
         Effect::SaveDownloadDir(dir) => {
+            // Never write settings back blind: `load` returns the safe
+            // fallback both for a corrupt file and for one from a newer
+            // swarmling, and saving that straight back would rewrite the file
+            // at this build's version and discard the user's real values.
+            let settings::Load::Clean(mut cfg) = settings::load_result(&rt.settings_path) else {
+                return vec![Action::Notice(
+                    "Settings file unreadable — folder not saved".into(),
+                )];
+            };
             let dir = expand_tilde(&dir);
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 return vec![Action::Notice(format!(
@@ -215,7 +224,6 @@ fn perform(effect: Effect, app: &App, rt: &mut Runtime) -> Vec<Action> {
                     dir.display()
                 ))];
             }
-            let mut cfg = settings::load(&rt.settings_path);
             cfg.download_dir = Some(dir.clone());
             if let Err(e) = settings::save(&rt.settings_path, &cfg) {
                 return vec![Action::Notice(format!("Could not save the folder ({e})"))];
@@ -269,7 +277,11 @@ pub async fn run() -> anyhow::Result<()> {
     let queue_path = paths::queue_state_path();
     let settings_path = paths::settings_path();
     let entries = load_entries(&queue_path);
-    let cfg = settings::load(&settings_path);
+    // Silent on purpose: a warning printed here would land in the alternate
+    // screen with raw mode on and corrupt the display. An untrustworthy file
+    // simply yields the default folder, and `SaveDownloadDir` refuses to
+    // overwrite it.
+    let cfg = settings::load_result(&settings_path).settings();
     let download_dir = cfg.download_dir.unwrap_or_else(paths::default_download_dir);
     let mut app = App::new(download_dir, entries);
 
@@ -534,6 +546,40 @@ mod tests {
         );
         assert!(target.is_dir(), "the folder was not created");
         assert_eq!(settings::load(&settings_path).download_dir, Some(target));
+    }
+
+    #[test]
+    fn a_settings_file_from_a_newer_version_is_not_overwritten_by_a_folder_change() {
+        // `settings::load` hands back the safe fallback for a file it cannot
+        // trust; writing that back would rewrite the file at this build's
+        // version and drop whatever the user really had in it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = dir.path().join("settings.json");
+        let original = br#"{"version":99,"settings":{"vpn_adapter":"nordvpn"}}"#;
+        std::fs::write(&settings_path, original).expect("write");
+        let mut rt = Runtime {
+            queue_path: dir.path().join("queue.json"),
+            settings_path: settings_path.clone(),
+            health: HashMap::new(),
+            search: None,
+            quit: false,
+        };
+        let app = App::new(dir.path().to_path_buf(), Vec::new());
+
+        let actions = perform(
+            Effect::SaveDownloadDir(dir.path().join("torrents")),
+            &app,
+            &mut rt,
+        );
+        assert!(
+            matches!(actions.as_slice(), [Action::Notice(_)]),
+            "expected a notice, got {actions:?}"
+        );
+        assert_eq!(
+            std::fs::read(&settings_path).expect("read"),
+            original.to_vec(),
+            "the settings file was rewritten with this build's defaults"
+        );
     }
 
     #[test]

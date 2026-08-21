@@ -69,28 +69,69 @@ pub fn save(path: &Path, settings: &Settings) -> std::io::Result<()> {
 /// the unknown value has to be the SAFE one, not the convenient one.
 /// `vpn_required` therefore comes back `true` in that case, with a warning,
 /// rather than quietly flipping off the protection the user asked for.
-pub fn load(path: &Path) -> Settings {
+/// The outcome of reading the settings file, for callers that must not write
+/// it back blind. Overwriting a file that could not be parsed — or one from a
+/// newer swarmling — with this build's defaults would silently discard the
+/// user's real preferences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Load {
+    /// Parsed cleanly, or a genuine first run with no file yet.
+    Clean(Settings),
+    /// The file could not be trusted. The settings are the safe fallback,
+    /// good enough to run on and not good enough to save.
+    Fallback { settings: Settings, reason: String },
+}
+
+impl Load {
+    pub fn settings(self) -> Settings {
+        match self {
+            Load::Clean(settings) => settings,
+            Load::Fallback { settings, .. } => settings,
+        }
+    }
+}
+
+/// Read the settings, reporting whether the file could be trusted. Silent:
+/// the caller decides how to tell the user, which matters once a TUI owns the
+/// screen and a stray `eprintln!` would corrupt it.
+pub fn load_result(path: &Path) -> Load {
     let Ok(bytes) = std::fs::read(path) else {
-        return Settings::default();
+        return Load::Clean(Settings::default());
     };
     match serde_json::from_slice::<Envelope>(&bytes) {
-        Ok(env) if env.version > CURRENT_VERSION => {
-            eprintln!(
-                "warn: {} was written by a newer swarmling (version {}, this build \
-                 understands {}); keeping safe settings instead of half-reading it",
+        Ok(env) if env.version > CURRENT_VERSION => Load::Fallback {
+            settings: safe_fallback(),
+            reason: format!(
+                "{} was written by a newer swarmling (version {}, this build \
+                 understands {})",
                 path.display(),
                 env.version,
                 CURRENT_VERSION
-            );
-            safe_fallback()
-        }
-        Ok(env) => env.settings,
-        Err(e) => {
-            eprintln!(
-                "warn: {} could not be read ({e}); assuming a VPN is required",
-                path.display()
-            );
-            safe_fallback()
+            ),
+        },
+        Ok(env) => Load::Clean(env.settings),
+        Err(e) => Load::Fallback {
+            settings: safe_fallback(),
+            reason: format!("{} could not be read ({e})", path.display()),
+        },
+    }
+}
+
+/// Settings never fail to load — a corrupt file must not stop the program —
+/// but "never fail" is not the same as "silently assume the defaults".
+///
+/// An absent file is a genuine first run and correctly yields defaults. A
+/// file that exists but cannot be parsed, or that was written by a newer
+/// version, means the user's real preferences are unknown; for a safety flag
+/// the unknown value has to be the SAFE one, not the convenient one.
+/// `vpn_required` therefore comes back `true` in that case, with a warning,
+/// rather than quietly flipping off the protection the user asked for.
+pub fn load(path: &Path) -> Settings {
+    match load_result(path) {
+        Load::Clean(settings) => settings,
+        Load::Fallback { settings, reason } => {
+            eprintln!("warn: {reason}; assuming a VPN is required");
+            settings
         }
     }
 }
@@ -156,6 +197,26 @@ mod tests {
                 "{name}: an unreadable settings file must not silently disable the VPN requirement"
             );
         }
+    }
+
+    #[test]
+    fn an_untrustworthy_file_is_reported_as_a_fallback_not_as_clean_data() {
+        // A caller that writes settings back must be able to tell "this is
+        // what the user chose" from "this is what we guessed", or a save
+        // rewrites a newer file at this build's version and drops fields.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            load_result(&dir.path().join("absent.json")),
+            Load::Clean(_)
+        ));
+
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, b"{ not json").unwrap();
+        assert!(matches!(load_result(&corrupt), Load::Fallback { .. }));
+
+        let future = dir.path().join("future.json");
+        std::fs::write(&future, br#"{"version":99,"settings":{}}"#).unwrap();
+        assert!(matches!(load_result(&future), Load::Fallback { .. }));
     }
 
     #[test]
