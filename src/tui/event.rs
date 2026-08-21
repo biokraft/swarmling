@@ -145,6 +145,257 @@ fn section_key(key: KeyEvent, section: Section) -> Option<KeyAction> {
     }
 }
 
+/// One documented binding: the key as it is shown to the user, a terse
+/// footer label, the help card's description, the action the key must
+/// produce, and the context it produces it in.
+///
+/// This table is the single source of truth for both the help card and the
+/// footer hints. `every_help_entry_names_a_key_that_really_does_what_it_claims`
+/// checks each row against `map_key`, so a binding that moves in the mapper
+/// without moving here fails the suite rather than lying on screen.
+#[derive(Debug, Clone)]
+pub struct Help {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub action: KeyAction,
+    pub ctx: Context,
+    /// Whether the footer has room to mention it. Navigation keys are left
+    /// out of the footer and documented on the help card only.
+    pub in_footer: bool,
+}
+
+/// Browsing a results list.
+pub const LIST_CTX: Context = Context {
+    mode: Mode::Normal,
+    overlay: Overlay::None,
+    region: Region::Content,
+    section: Section::All,
+};
+
+/// Browsing the queue.
+pub const QUEUE_CTX: Context = Context {
+    mode: Mode::Normal,
+    overlay: Overlay::None,
+    region: Region::Content,
+    section: Section::Downloads,
+};
+
+/// The detail view of one result.
+pub const DETAIL_CTX: Context = Context {
+    mode: Mode::Detail,
+    overlay: Overlay::None,
+    region: Region::Content,
+    section: Section::All,
+};
+
+const fn nav(
+    key: &'static str,
+    label: &'static str,
+    description: &'static str,
+    action: KeyAction,
+    ctx: Context,
+) -> Help {
+    Help {
+        key,
+        label,
+        description,
+        action,
+        ctx,
+        in_footer: false,
+    }
+}
+
+const fn cmd(
+    key: &'static str,
+    label: &'static str,
+    description: &'static str,
+    action: KeyAction,
+    ctx: Context,
+) -> Help {
+    Help {
+        key,
+        label,
+        description,
+        action,
+        ctx,
+        in_footer: true,
+    }
+}
+
+pub const HELP: &[Help] = &[
+    // Results list.
+    nav("↑", "up", "Move up", KeyAction::Up, LIST_CTX),
+    nav("k", "up", "Move up", KeyAction::Up, LIST_CTX),
+    nav("↓", "down", "Move down", KeyAction::Down, LIST_CTX),
+    nav("j", "down", "Move down", KeyAction::Down, LIST_CTX),
+    nav(
+        "⇥",
+        "focus",
+        "Switch between the sidebar and the list",
+        KeyAction::Tab,
+        LIST_CTX,
+    ),
+    cmd(
+        "↵",
+        "detail",
+        "Open the selected result",
+        KeyAction::Enter,
+        LIST_CTX,
+    ),
+    cmd(
+        "d",
+        "download",
+        "Queue a download",
+        KeyAction::Download,
+        LIST_CTX,
+    ),
+    cmd(
+        "D",
+        "download to…",
+        "Queue a download to a chosen folder",
+        KeyAction::DownloadTo,
+        LIST_CTX,
+    ),
+    cmd(
+        "y",
+        "copy",
+        "Copy the magnet link",
+        KeyAction::CopyMagnet,
+        LIST_CTX,
+    ),
+    cmd(
+        "f",
+        "filter",
+        "Filter the results",
+        KeyAction::EditFilter,
+        LIST_CTX,
+    ),
+    cmd(
+        "s",
+        "sort",
+        "Cycle the sort",
+        KeyAction::CycleSort,
+        LIST_CTX,
+    ),
+    cmd(
+        "z",
+        "dead",
+        "Hide or show dead torrents",
+        KeyAction::ToggleHideDead,
+        LIST_CTX,
+    ),
+    cmd(
+        "/",
+        "search",
+        "Start a new search",
+        KeyAction::EditSearch,
+        LIST_CTX,
+    ),
+    cmd(
+        "o",
+        "folder",
+        "Set the default download folder",
+        KeyAction::FolderPrompt,
+        LIST_CTX,
+    ),
+    cmd("?", "help", "Show this help", KeyAction::Help, LIST_CTX),
+    cmd("q", "quit", "Quit", KeyAction::Quit, LIST_CTX),
+    // Queue.
+    cmd(
+        "c",
+        "remove",
+        "Remove one queue entry",
+        KeyAction::RemoveEntry,
+        QUEUE_CTX,
+    ),
+    cmd(
+        "C",
+        "clear",
+        "Clear the whole queue",
+        KeyAction::ClearQueue,
+        QUEUE_CTX,
+    ),
+    cmd(
+        "o",
+        "folder",
+        "Set the default download folder",
+        KeyAction::FolderPrompt,
+        QUEUE_CTX,
+    ),
+    cmd("?", "help", "Show this help", KeyAction::Help, QUEUE_CTX),
+    cmd("q", "quit", "Quit", KeyAction::Quit, QUEUE_CTX),
+    // Detail view.
+    cmd(
+        "d",
+        "download",
+        "Queue a download",
+        KeyAction::Download,
+        DETAIL_CTX,
+    ),
+    cmd(
+        "y",
+        "copy",
+        "Copy the magnet link",
+        KeyAction::CopyMagnet,
+        DETAIL_CTX,
+    ),
+    cmd(
+        "esc",
+        "back",
+        "Leave the detail view",
+        KeyAction::Escape,
+        DETAIL_CTX,
+    ),
+];
+
+/// Which documented context the app is in. The table documents three:
+/// the results list, the queue, and the detail view.
+pub fn help_context(mode: Mode, section: Section) -> Context {
+    if section == Section::Downloads {
+        QUEUE_CTX
+    } else if mode == Mode::Detail {
+        DETAIL_CTX
+    } else {
+        LIST_CTX
+    }
+}
+
+/// The bindings the footer should advertise in `ctx`, in table order.
+pub fn footer_hints(ctx: Context) -> impl Iterator<Item = &'static Help> {
+    HELP.iter()
+        .filter(move |h| h.in_footer && h.ctx.mode == ctx.mode && h.ctx.section == ctx.section)
+}
+
+/// Turn a help card key string back into the event it names, so the table
+/// can be checked against the mapper it documents.
+pub fn parse_help_key(key: &str) -> Option<KeyEvent> {
+    let (code, modifiers) = match key {
+        "↑" => (KeyCode::Up, KeyModifiers::NONE),
+        "↓" => (KeyCode::Down, KeyModifiers::NONE),
+        "←" => (KeyCode::Left, KeyModifiers::NONE),
+        "→" => (KeyCode::Right, KeyModifiers::NONE),
+        "⇥" => (KeyCode::Tab, KeyModifiers::NONE),
+        "↵" => (KeyCode::Enter, KeyModifiers::NONE),
+        "esc" => (KeyCode::Esc, KeyModifiers::NONE),
+        "^c" => (KeyCode::Char('c'), KeyModifiers::CONTROL),
+        other => {
+            let mut chars = other.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            let modifiers = if c.is_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            (KeyCode::Char(c), modifiers)
+        }
+    };
+    Some(KeyEvent::new(code, modifiers))
+}
+
 /// Resolves one key press to the action it means in the current UI context.
 /// Returns `None` for anything unbound — never a catch-all default.
 pub fn map_key(key: KeyEvent, ctx: Context) -> Option<KeyAction> {
@@ -198,6 +449,38 @@ mod tests {
             mode: Mode::Search,
             ..list()
         }
+    }
+
+    #[test]
+    fn every_help_entry_names_a_key_that_really_does_what_it_claims() {
+        // The help card is the one surface that must not lie. Deriving it
+        // from a table is not enough on its own — this test is what catches
+        // a binding renamed in map_key while the table kept the old key.
+        for entry in HELP {
+            let event = parse_help_key(entry.key)
+                .unwrap_or_else(|| panic!("help key {} is unparseable", entry.key));
+            assert_eq!(
+                map_key(event, entry.ctx),
+                Some(entry.action.clone()),
+                "help says {} = {}, but map_key disagrees",
+                entry.key,
+                entry.description
+            );
+        }
+    }
+
+    #[test]
+    fn the_footer_advertises_only_keys_bound_in_that_context() {
+        for ctx in [LIST_CTX, QUEUE_CTX, DETAIL_CTX] {
+            let hints: Vec<&str> = footer_hints(ctx).map(|h| h.key).collect();
+            assert!(!hints.is_empty(), "{ctx:?} has no footer hints");
+        }
+        let queue: Vec<&str> = footer_hints(QUEUE_CTX).map(|h| h.key).collect();
+        assert!(queue.contains(&"c") && queue.contains(&"C"));
+        assert!(
+            !queue.contains(&"d"),
+            "the queue footer must not advertise the download key"
+        );
     }
 
     #[test]

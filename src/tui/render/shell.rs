@@ -9,6 +9,7 @@ use ratatui::Frame;
 
 use super::{downloads, empty, results, truncate};
 use crate::tui::app::{App, Mode, Region, Section};
+use crate::tui::event;
 use crate::tui::layout::{rail_width, regions};
 use crate::tui::theme::{icon, ACCENT, ALT, BRIGHT, RULE, TEXT};
 use crate::tui::wordmark::SPROUT;
@@ -137,17 +138,20 @@ fn footer_line(frame: &mut Frame, area: Rect, app: &App) {
     if empty(area) {
         return;
     }
-    let hint = match (app.section, app.mode, app.region) {
-        (_, Mode::Search, _) => "↵ search · esc cancel",
-        (_, Mode::Filter, _) => "↵ apply · esc cancel",
-        (_, Mode::Detail, _) => "d download · y copy · esc back",
-        (Section::Downloads, _, Region::Content) => "x remove · X clear · ? help",
-        (_, _, Region::Content) => "↵ detail · d download · / filter · s sort · ? help",
-        (_, _, Region::Sidebar) => "⇥ focus · / search · o folder · ? help · q quit",
+    // Every hint is derived from the key table, so the footer cannot
+    // advertise a key the mapper does not bind. The two editing modes are
+    // not in the table: Enter and Escape are bound by the readline layer.
+    let hint = match app.mode {
+        Mode::Search => "↵ search · esc cancel".to_owned(),
+        Mode::Filter => "↵ apply · esc cancel".to_owned(),
+        _ => event::footer_hints(event::help_context(app.mode, app.section))
+            .map(|h| format!("{} {}", h.key, h.label))
+            .collect::<Vec<_>>()
+            .join(&format!(" {} ", icon::DOT)),
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate(hint, area.width as usize),
+            truncate(&hint, area.width as usize),
             Style::default().fg(RULE),
         ))),
         area,

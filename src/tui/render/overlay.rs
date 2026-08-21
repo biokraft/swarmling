@@ -9,24 +9,9 @@ use ratatui::Frame;
 
 use super::{empty, field_spans, pad, truncate};
 use crate::tui::app::{App, Overlay};
+use crate::tui::event;
 use crate::tui::layout::centered;
 use crate::tui::theme::{ACCENT, ALT, BRIGHT, RULE, TEXT};
-
-const KEYS: &[(&str, &str)] = &[
-    ("↑ ↓ j k", "Move"),
-    ("⇥", "Switch between the sidebar and the list"),
-    ("↵", "Open the selected result"),
-    ("/", "Filter the results"),
-    ("s", "Cycle the sort"),
-    ("h", "Hide or show dead torrents"),
-    ("d", "Queue a download"),
-    ("D", "Queue a download to a chosen folder"),
-    ("y", "Copy the magnet link"),
-    ("o", "Set the default download folder"),
-    ("x  X", "Remove one queue entry, or clear the queue"),
-    ("?", "Show this help"),
-    ("q  ^c", "Quit"),
-];
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     if empty(area) {
@@ -67,13 +52,32 @@ fn card(frame: &mut Frame, area: Rect, title: &'static str, lines: Vec<Line<'sta
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The help card is derived from `event::HELP` so it can never document a
+/// key the mapper does not bind. Keys that mean the same thing share a row.
+fn help_rows() -> Vec<(String, &'static str)> {
+    let mut rows: Vec<(String, &'static str)> = Vec::new();
+    for entry in event::HELP {
+        match rows.iter_mut().find(|(_, d)| *d == entry.description) {
+            Some((keys, _)) => {
+                if !keys.split(' ').any(|k| k == entry.key) {
+                    keys.push(' ');
+                    keys.push_str(entry.key);
+                }
+            }
+            None => rows.push((entry.key.to_owned(), entry.description)),
+        }
+    }
+    rows
+}
+
 fn help(frame: &mut Frame, area: Rect) {
-    let key_w = KEYS
+    let rows = help_rows();
+    let key_w = rows
         .iter()
         .map(|(k, _)| k.chars().count())
         .max()
         .unwrap_or(0);
-    let lines: Vec<Line<'static>> = KEYS
+    let lines: Vec<Line<'static>> = rows
         .iter()
         .map(|(key, description)| {
             Line::from(vec![
@@ -82,7 +86,7 @@ fn help(frame: &mut Frame, area: Rect) {
             ])
         })
         .collect();
-    let width = KEYS
+    let width = rows
         .iter()
         .map(|(k, d)| k.chars().count() + d.chars().count() + 6)
         .max()

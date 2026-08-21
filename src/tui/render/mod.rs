@@ -312,6 +312,42 @@ mod tests {
     }
 
     #[test]
+    fn the_help_card_names_the_real_filter_and_hide_dead_keys() {
+        // These were documented as `/` and `h` while the mapper bound them
+        // to `f` and `z`, so the card sent users to a navigation key.
+        let mut a = app();
+        a.update(Action::Key(KeyAction::Enter));
+        a.update(Action::Key(KeyAction::Help));
+        let text = text_of(&render(&a, 120, 40));
+        assert!(text.contains("Filter the results"), "{text}");
+        assert!(text.contains("Hide or show dead torrents"), "{text}");
+        assert!(text.contains("Remove one queue entry"), "{text}");
+        // The key column sits between the card's left border and the
+        // description, so read it back out of the rendered line.
+        let key_for = |description: &str| -> String {
+            let line = text
+                .lines()
+                .find(|l| l.contains(description))
+                .unwrap_or_else(|| panic!("{description} is not on the card:\n{text}"));
+            let before = &line[..line.find(description).unwrap_or(0)];
+            before.rsplit('│').next().unwrap_or("").trim().to_owned()
+        };
+        assert_eq!(key_for("Filter the results"), "f");
+        assert_eq!(key_for("Hide or show dead torrents"), "z");
+        assert_eq!(key_for("Remove one queue entry"), "c");
+    }
+
+    #[test]
+    fn the_footer_names_the_real_queue_keys_in_the_downloads_section() {
+        let mut a = app();
+        a.update(Action::Key(KeyAction::Enter));
+        a.set_section(crate::tui::app::Section::Downloads);
+        let text = text_of(&render(&a, 120, 40));
+        assert!(text.contains("c remove"), "{text}");
+        assert!(text.contains("C clear"), "{text}");
+    }
+
+    #[test]
     fn the_selected_row_is_styled_differently_from_its_neighbour() {
         // Without this the user cannot tell where the cursor is. Sampling a
         // fixed column would pass on the panel border alone, so this finds
