@@ -55,6 +55,10 @@ const VPN_POLL: Duration = Duration::from_secs(2);
 /// session exists, so an idle app polls nothing.
 const SESSION_POLL: Duration = Duration::from_secs(1);
 
+/// How long the engine gets to answer a poll. Generous for an in-process
+/// call, and well under the point where a person would call the UI frozen.
+const ENGINE_POLL_LIMIT: Duration = Duration::from_secs(5);
+
 /// Leave raw mode and the alternate screen, ignoring errors. Called on the
 /// normal exit path and from the panic hook, so it must be safe to call
 /// twice and must never panic itself.
@@ -106,6 +110,9 @@ struct Session {
     driver: Driver,
     guard: Guard,
     adapter: Box<dyn VpnAdapter>,
+    /// Whether the last engine poll went unanswered. Keeps the stall to one
+    /// notice rather than one per tick: a notice storm is its own defect.
+    snapshot_stalled: bool,
 }
 
 /// Every notice the driver produces has to reach the user: a dropped one is a
@@ -147,13 +154,53 @@ async fn poll_vpn(session: &mut Session) -> Vec<Action> {
 
 /// Ask a live session what it is doing. Silent while none exists, so a fresh
 /// app never reports progress it does not have.
+/// Both polls run in the same `select!` in the same task, so an unbounded
+/// engine call here would hold the loop and, with it, the VPN tick: a tunnel
+/// dropping during the hang would go unnoticed while the session kept
+/// transferring. That is the kill switch defeated through a second door, so
+/// the engine gets a deadline as well.
+///
+/// A missed deadline means "no fresh information this tick", never "protection
+/// failed". The session stays up, the last known snapshots stay on screen, and
+/// the user is told once — not once a second — that the display has gone
+/// stale.
 async fn poll_session(session: &mut Session) -> Vec<Action> {
     if !session.driver.session_is_live() {
         return Vec::new();
     }
-    let mut actions = notices(session.driver.poll_completions().await);
-    actions.push(Action::SnapshotsUpdated(session.driver.snapshots().await));
+
+    let completions =
+        match tokio::time::timeout(ENGINE_POLL_LIMIT, session.driver.poll_completions()).await {
+            Ok(notices) => notices,
+            Err(_) => return stalled(session),
+        };
+    let snapshots = match tokio::time::timeout(ENGINE_POLL_LIMIT, session.driver.snapshots()).await
+    {
+        Ok(snapshots) => snapshots,
+        Err(_) => {
+            let mut actions = notices(completions);
+            actions.extend(stalled(session));
+            return actions;
+        }
+    };
+
+    session.snapshot_stalled = false;
+    let mut actions = notices(completions);
+    actions.push(Action::SnapshotsUpdated(snapshots));
     actions
+}
+
+/// Report an engine that did not answer in time, at most once per stall.
+fn stalled(session: &mut Session) -> Vec<Action> {
+    if session.snapshot_stalled {
+        return Vec::new();
+    }
+    session.snapshot_stalled = true;
+    vec![Action::Notice(
+        "The download backend is not answering — progress shown may be out of date. \
+         Transfers are still protected."
+            .into(),
+    )]
 }
 
 /// The three effects that touch a real session. Separate from [`perform`]
@@ -504,6 +551,7 @@ pub async fn run() -> anyhow::Result<()> {
         driver: Driver::new(factory, Supervisor::new(crate::vpn::policy::bind_support())),
         guard: Guard::new(),
         adapter: crate::vpn::require::adapter_for(&cfg),
+        snapshot_stalled: false,
     };
 
     let mut rt = Runtime {
@@ -643,6 +691,7 @@ mod tests {
             ),
             guard: Guard::new(),
             adapter: Box::new(crate::vpn::adapter::GenericAdapter::new(interfaces)),
+            snapshot_stalled: false,
         };
         (factory, session)
     }
@@ -856,6 +905,136 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(a, Action::Notice(_))),
             "the user must be told why everything stopped: {actions:?}"
+        );
+    }
+
+    /// An engine that answers every call except the snapshot poll, which never
+    /// returns. Stands in for a wedged backend. Opens nothing.
+    struct WedgedEngine;
+
+    #[async_trait::async_trait]
+    impl crate::engine::TorrentEngine for WedgedEngine {
+        async fn add_magnet(
+            &self,
+            _magnet: &str,
+            _output_dir: &std::path::Path,
+            _paused: bool,
+        ) -> Result<crate::engine::InfoHash, crate::engine::EngineError> {
+            Ok("wedged".to_string())
+        }
+        async fn pause(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn resume(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn remove(
+            &self,
+            _infohash: &str,
+            _delete_files: bool,
+        ) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn snapshot(
+            &self,
+            _infohash: &str,
+        ) -> Result<crate::engine::TorrentSnapshot, crate::engine::EngineError> {
+            std::future::pending().await
+        }
+        async fn snapshots(&self) -> Vec<crate::engine::TorrentSnapshot> {
+            std::future::pending().await
+        }
+    }
+
+    struct WedgedEngineFactory;
+
+    #[async_trait::async_trait]
+    impl SessionFactory for WedgedEngineFactory {
+        async fn build(
+            &self,
+            _device: Option<&str>,
+        ) -> Result<Arc<dyn crate::engine::TorrentEngine>, crate::engine::EngineError> {
+            Ok(Arc::new(WedgedEngine))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_engine_stalls_the_display_without_stalling_the_kill_switch() {
+        // Both polls share one select loop in one task. An unbounded snapshot
+        // call would hold the loop, so the VPN would never be looked at, and a
+        // tunnel dropping during the hang would go unnoticed while the session
+        // kept transferring. A slow poll means no fresh information this tick;
+        // it must never be escalated into a protection failure, and it must
+        // never cost the kill switch its turn.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let mut session = Session {
+            driver: Driver::new(
+                Arc::new(WedgedEngineFactory) as Arc<dyn SessionFactory>,
+                Supervisor::new(BindSupport::Supported),
+            ),
+            guard: Guard::new(),
+            adapter: Box::new(crate::vpn::adapter::GenericAdapter::new(
+                Arc::clone(&interfaces) as Arc<dyn crate::vpn::interfaces::InterfaceProvider>,
+            )),
+            snapshot_stalled: false,
+        };
+        let hash = "7".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        // The start itself must not hang: only the snapshot poll is wedged.
+        let started = tokio::time::timeout(
+            Duration::from_secs(600),
+            perform_session(Effect::StartDownload(hash), &app, &mut session),
+        )
+        .await
+        .expect("a start must not wait on the snapshot poll");
+        assert!(session.driver.session_is_live(), "{started:?}");
+
+        let stalled = tokio::time::timeout(Duration::from_secs(600), poll_session(&mut session))
+            .await
+            .expect("a wedged snapshot poll must not hold the loop");
+
+        assert!(
+            session.driver.session_is_live(),
+            "a slow poll is not a protection failure and must not kill the session: {stalled:?}"
+        );
+        assert!(
+            !stalled
+                .iter()
+                .any(|a| matches!(a, Action::SnapshotsUpdated(_))),
+            "no answer means no fresh snapshots, not empty ones: {stalled:?}"
+        );
+        // Once per stall, not once per tick: a notice storm is its own defect.
+        // The start's own poll is the first tick that meets the wedged engine,
+        // so the announcement belongs to whichever of the two came first, and
+        // to exactly one of them.
+        let again = tokio::time::timeout(Duration::from_secs(600), poll_session(&mut session))
+            .await
+            .expect("still must not hold the loop");
+        let announcements = started
+            .iter()
+            .chain(stalled.iter())
+            .chain(again.iter())
+            .filter(|a| matches!(a, Action::Notice(n) if n.contains("not answering")))
+            .count();
+        assert_eq!(
+            announcements, 1,
+            "a stall must be announced once and then stay quiet: \
+             {started:?} / {stalled:?} / {again:?}"
+        );
+
+        // The point of the whole fix: the kill switch is still reachable.
+        interfaces.set(vec![tunnel("en0")]);
+        let actions = tokio::time::timeout(Duration::from_secs(600), poll_vpn(&mut session))
+            .await
+            .expect("the VPN poll must still get its turn while the engine is wedged");
+        assert!(
+            !session.driver.session_is_live(),
+            "a tunnel lost while the engine is wedged must still stop everything: {actions:?}"
         );
     }
 
