@@ -1,0 +1,432 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use crate::engine::InfoHash;
+use crate::vpn::guard::GuardAction;
+use crate::vpn::policy::BindSupport;
+
+/// A torrent the user wants the session to be carrying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wanted {
+    pub infohash: InfoHash,
+    pub magnet: String,
+    pub dir: PathBuf,
+    pub paused: bool,
+}
+
+/// Whether a session exists, and what it is bound to. `device: None` means the
+/// session is running unbound, which only happens where the platform cannot
+/// bind at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionState {
+    Down,
+    Live { device: Option<String> },
+}
+
+/// What the user has asked for. Distinct from `SessionOp`: an intent is a wish,
+/// an op is an instruction that has already cleared the safety rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Intent {
+    Add(Wanted),
+    Start(InfoHash),
+    Pause(InfoHash),
+    Remove {
+        infohash: InfoHash,
+        delete_files: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Input {
+    Vpn(GuardAction),
+    User(Intent),
+    Completed(InfoHash),
+    SessionFailed(String),
+}
+
+/// An instruction for the driver. Every variant is safe to execute at the
+/// moment it is emitted; the safety decisions were made before it existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOp {
+    Build {
+        device: Option<String>,
+    },
+    Kill {
+        reason: String,
+    },
+    AddTorrent {
+        infohash: InfoHash,
+        magnet: String,
+        dir: PathBuf,
+        paused: bool,
+    },
+    PauseTorrent(InfoHash),
+    ResumeTorrent(InfoHash),
+    RemoveTorrent {
+        infohash: InfoHash,
+        delete_files: bool,
+    },
+    Notice(String),
+}
+
+/// What the guard has most recently confirmed about the tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Protection {
+    Unprotected,
+    /// `device: None` means protected, but on a platform that cannot bind.
+    Protected {
+        device: Option<String>,
+    },
+}
+
+pub struct Supervisor {
+    state: SessionState,
+    protection: Protection,
+    bind: BindSupport,
+    wanted: Vec<Wanted>,
+    in_session: HashSet<InfoHash>,
+    /// Set when a build or add failed. Blocks automatic retries so a broken
+    /// backend cannot spin. Cleared by any fresh guard event or user intent.
+    stalled: bool,
+}
+
+impl Supervisor {
+    pub fn new(bind: BindSupport) -> Self {
+        Self {
+            state: SessionState::Down,
+            protection: Protection::Unprotected,
+            bind,
+            wanted: Vec::new(),
+            in_session: HashSet::new(),
+            stalled: false,
+        }
+    }
+
+    pub fn state(&self) -> &SessionState {
+        &self.state
+    }
+
+    /// The torrents the user currently wants carried. Exposed for the driver's
+    /// snapshot poll, which only asks about these.
+    pub fn wanted(&self) -> &[Wanted] {
+        &self.wanted
+    }
+
+    pub fn handle(&mut self, input: Input) -> Vec<SessionOp> {
+        let mut ops = Vec::new();
+        match input {
+            Input::Vpn(action) => self.apply_vpn(action, &mut ops),
+            Input::User(intent) => self.apply_intent(intent, &mut ops),
+            Input::Completed(infohash) => {
+                self.stalled = false;
+                // Never seed: a finished torrent leaves the session at once.
+                if self.in_session.remove(&infohash) {
+                    ops.push(SessionOp::RemoveTorrent {
+                        infohash: infohash.clone(),
+                        delete_files: false,
+                    });
+                }
+                self.wanted.retain(|w| w.infohash != infohash);
+            }
+            Input::SessionFailed(message) => {
+                self.state = SessionState::Down;
+                self.in_session.clear();
+                self.stalled = true;
+                ops.push(SessionOp::Notice(message));
+                return ops;
+            }
+        }
+        self.reconcile(&mut ops);
+        ops
+    }
+
+    fn apply_vpn(&mut self, action: GuardAction, ops: &mut Vec<SessionOp>) {
+        match action {
+            GuardAction::None => {}
+            GuardAction::PauseAll { reason } => {
+                self.stalled = false;
+                self.protection = Protection::Unprotected;
+                self.kill(reason, ops);
+            }
+            GuardAction::Bind { device } | GuardAction::Rebind { device } => {
+                self.stalled = false;
+                let new = self.device_for(&device);
+                let changed =
+                    !matches!(&self.protection, Protection::Protected { device: d } if *d == new);
+                self.protection = Protection::Protected { device: new };
+                // A different tunnel means the live session is bound to a
+                // device that is no longer the protected one. Kill it; the
+                // reconcile below builds a correctly bound replacement.
+                if changed {
+                    self.kill("the VPN moved to a different device".to_string(), ops);
+                }
+            }
+        }
+    }
+
+    /// The device a session should bind to, or `None` where the platform
+    /// cannot bind at all.
+    fn device_for(&self, device: &str) -> Option<String> {
+        match self.bind {
+            BindSupport::Supported => Some(device.to_string()),
+            BindSupport::Unsupported => None,
+        }
+    }
+
+    fn kill(&mut self, reason: String, ops: &mut Vec<SessionOp>) {
+        if matches!(self.state, SessionState::Live { .. }) {
+            self.state = SessionState::Down;
+            self.in_session.clear();
+            ops.push(SessionOp::Kill { reason });
+        }
+    }
+
+    fn apply_intent(&mut self, intent: Intent, ops: &mut Vec<SessionOp>) {
+        self.stalled = false;
+        match intent {
+            Intent::Add(w) => {
+                if self.wanted.iter().any(|x| x.infohash == w.infohash) {
+                    return;
+                }
+                if matches!(self.protection, Protection::Unprotected) {
+                    ops.push(SessionOp::Notice(
+                        "queued. Nothing will be downloaded until a VPN tunnel is up.".to_string(),
+                    ));
+                }
+                self.wanted.push(w);
+            }
+            // Start, Pause and Remove arrive in the next task. Until then they
+            // change nothing, which is the safe direction: no session, no
+            // traffic.
+            Intent::Start(_) | Intent::Pause(_) | Intent::Remove { .. } => {}
+        }
+    }
+
+    /// Bring the session in line with what is wanted. This is where the
+    /// safety rules bite: a build is only ever emitted from a protected state.
+    fn reconcile(&mut self, ops: &mut Vec<SessionOp>) {
+        let device = match &self.protection {
+            Protection::Unprotected => {
+                self.kill("no confirmed VPN tunnel".to_string(), ops);
+                return;
+            }
+            Protection::Protected { device } => device.clone(),
+        };
+
+        if !self.wanted.iter().any(|w| !w.paused) {
+            // Nothing active to carry: hold no session, and therefore no
+            // sockets.
+            self.kill("nothing left to download".to_string(), ops);
+            return;
+        }
+
+        if self.stalled {
+            return;
+        }
+
+        if matches!(self.state, SessionState::Down) {
+            ops.push(SessionOp::Build {
+                device: device.clone(),
+            });
+            if device.is_none() {
+                ops.push(SessionOp::Notice(
+                    "this platform cannot bind torrent traffic to the VPN device: \
+                     traffic is not pinned to the tunnel"
+                        .to_string(),
+                ));
+            }
+            self.state = SessionState::Live { device };
+        }
+
+        for w in &self.wanted {
+            if !self.in_session.contains(&w.infohash) {
+                ops.push(SessionOp::AddTorrent {
+                    infohash: w.infohash.clone(),
+                    magnet: w.magnet.clone(),
+                    dir: w.dir.clone(),
+                    paused: w.paused,
+                });
+                self.in_session.insert(w.infohash.clone());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vpn::guard::GuardAction;
+
+    fn wanted(infohash: &str) -> Wanted {
+        Wanted {
+            infohash: infohash.to_string(),
+            magnet: format!("magnet:?xt=urn:btih:{infohash}"),
+            dir: std::path::PathBuf::from("/downloads"),
+            paused: false,
+        }
+    }
+
+    fn bound() -> Supervisor {
+        Supervisor::new(BindSupport::Supported)
+    }
+
+    #[test]
+    fn nothing_is_built_while_unprotected() {
+        let mut s = bound();
+        let ops = s.handle(Input::User(Intent::Add(wanted("aa"))));
+        assert!(
+            !ops.iter().any(|op| matches!(op, SessionOp::Build { .. })),
+            "a session must never be built without a confirmed tunnel: {ops:?}"
+        );
+        assert_eq!(s.state(), &SessionState::Down);
+    }
+
+    #[test]
+    fn protection_with_something_wanted_builds_a_bound_session() {
+        let mut s = bound();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        let ops = s.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }));
+        assert_eq!(
+            ops,
+            vec![
+                SessionOp::Build {
+                    device: Some("utun4".to_string())
+                },
+                SessionOp::AddTorrent {
+                    infohash: "aa".to_string(),
+                    magnet: "magnet:?xt=urn:btih:aa".to_string(),
+                    dir: std::path::PathBuf::from("/downloads"),
+                    paused: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn protection_with_nothing_wanted_builds_nothing() {
+        // An idle app holds no session, so it holds no sockets.
+        let mut s = bound();
+        let ops = s.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }));
+        assert_eq!(ops, vec![]);
+        assert_eq!(s.state(), &SessionState::Down);
+    }
+
+    #[test]
+    fn a_dropped_tunnel_kills_the_session() {
+        let mut s = bound();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        s.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }));
+        let ops = s.handle(Input::Vpn(GuardAction::PauseAll {
+            reason: "tunnel utun4 went away".into(),
+        }));
+        assert_eq!(
+            ops,
+            vec![SessionOp::Kill {
+                reason: "tunnel utun4 went away".to_string()
+            }]
+        );
+        assert_eq!(s.state(), &SessionState::Down);
+    }
+
+    #[test]
+    fn reconnecting_rebuilds_and_re_adds_everything_wanted() {
+        let mut s = bound();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        s.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }));
+        s.handle(Input::Vpn(GuardAction::PauseAll {
+            reason: "gone".into(),
+        }));
+        let ops = s.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun9".into(),
+        }));
+        assert_eq!(
+            ops,
+            vec![
+                SessionOp::Build {
+                    device: Some("utun9".to_string())
+                },
+                SessionOp::AddTorrent {
+                    infohash: "aa".to_string(),
+                    magnet: "magnet:?xt=urn:btih:aa".to_string(),
+                    dir: std::path::PathBuf::from("/downloads"),
+                    paused: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rebind_kills_before_it_builds() {
+        let mut s = bound();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        s.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }));
+        let ops = s.handle(Input::Vpn(GuardAction::Rebind {
+            device: "utun9".into(),
+        }));
+        let kill = ops
+            .iter()
+            .position(|op| matches!(op, SessionOp::Kill { .. }));
+        let build = ops
+            .iter()
+            .position(|op| matches!(op, SessionOp::Build { .. }));
+        assert!(
+            kill.is_some() && build.is_some(),
+            "expected both a kill and a build: {ops:?}"
+        );
+        assert!(
+            kill < build,
+            "the old session must die before the new one is built: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn an_unbindable_platform_runs_unbound_and_says_so() {
+        // Windows cannot pin traffic to the tunnel device. It still refuses to
+        // run without one, but the user must be told the traffic is unpinned.
+        let mut s = Supervisor::new(BindSupport::Unsupported);
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        let ops = s.handle(Input::Vpn(GuardAction::Bind {
+            device: "wg0".into(),
+        }));
+        assert!(
+            ops.contains(&SessionOp::Build { device: None }),
+            "an unbindable platform must build an unbound session: {ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, SessionOp::Notice(m) if m.contains("not pinned"))),
+            "the user must be told traffic is not pinned to the device: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn guard_inaction_produces_no_ops() {
+        let mut s = bound();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        s.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }));
+        assert_eq!(s.handle(Input::Vpn(GuardAction::None)), vec![]);
+    }
+
+    #[test]
+    fn a_kill_while_already_down_does_nothing() {
+        let mut s = bound();
+        assert_eq!(
+            s.handle(Input::Vpn(GuardAction::PauseAll {
+                reason: "gone".into()
+            })),
+            vec![]
+        );
+    }
+}
