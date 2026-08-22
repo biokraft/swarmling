@@ -9,11 +9,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::download::queue::QueueEntry;
+use crate::engine::TorrentSnapshot;
 use crate::sources::magnet::parse_magnet;
 use crate::sources::{registry::all_sources, SourceGroup};
 use crate::tui::action::{Action, Effect, KeyAction};
 use crate::tui::results::Results;
 use crate::tui::textfield::TextField;
+use crate::vpn::guard::GuardState;
 
 /// How long a notice stays on screen.
 const NOTICE_TTL: Duration = Duration::from_secs(4);
@@ -141,6 +143,10 @@ pub struct App {
     /// Which groups each source belongs to, so streamed results can be
     /// classified without asking the registry again on every batch.
     groups: Vec<(&'static str, &'static [SourceGroup])>,
+    /// The live session's latest report about each torrent it carries.
+    snapshots: Vec<TorrentSnapshot>,
+    /// The VPN guard's view of the tunnel.
+    guard: GuardState,
 }
 
 impl App {
@@ -165,11 +171,23 @@ impl App {
             size: (80, 24),
             pending: None,
             groups: all_sources().iter().map(|s| (s.id(), s.groups())).collect(),
+            snapshots: Vec::new(),
+            guard: GuardState::Unprotected,
         }
     }
 
     pub fn notice_text(&self) -> Option<&str> {
         self.notice.as_ref().map(|n| n.text.as_str())
+    }
+
+    /// The live session's latest report about each torrent it carries.
+    pub fn snapshots(&self) -> &[TorrentSnapshot] {
+        &self.snapshots
+    }
+
+    /// The VPN guard's view of the tunnel.
+    pub fn guard_state(&self) -> &GuardState {
+        &self.guard
     }
 
     fn set_notice(&mut self, text: impl Into<String>) {
@@ -307,6 +325,14 @@ impl App {
             Action::QueueChanged(queue) => {
                 self.queue = queue;
                 self.queue_cursor = self.queue_cursor.min(self.queue.len().saturating_sub(1));
+                Vec::new()
+            }
+            Action::SnapshotsUpdated(snapshots) => {
+                self.snapshots = snapshots;
+                Vec::new()
+            }
+            Action::GuardChanged(guard) => {
+                self.guard = guard;
                 Vec::new()
             }
             Action::Key(key) => self.on_key(key),
@@ -717,6 +743,24 @@ impl App {
                     return Vec::new();
                 }
                 vec![Effect::ClearQueue]
+            }
+            KeyAction::StartDownload => {
+                if self.section != Section::Downloads {
+                    return Vec::new();
+                }
+                let Some(entry) = self.queue.get(self.queue_cursor) else {
+                    return Vec::new();
+                };
+                vec![Effect::StartDownload(entry.infohash.clone())]
+            }
+            KeyAction::PauseDownload => {
+                if self.section != Section::Downloads {
+                    return Vec::new();
+                }
+                let Some(entry) = self.queue.get(self.queue_cursor) else {
+                    return Vec::new();
+                };
+                vec![Effect::PauseDownload(entry.infohash.clone())]
             }
             KeyAction::Insert(_)
             | KeyAction::Backspace
@@ -1240,6 +1284,91 @@ mod tests {
         b.update(Action::Key(KeyAction::EditFilter));
         assert_eq!(b.mode, Mode::Filter);
     }
+    fn entry(infohash: &str) -> crate::download::queue::QueueEntry {
+        crate::download::queue::QueueEntry {
+            infohash: infohash.to_string(),
+            magnet: format!("magnet:?xt=urn:btih:{infohash}"),
+            title: format!("torrent {infohash}"),
+            added_unix: 0,
+            paused: false,
+            source_id: None,
+            dir: None,
+        }
+    }
+
+    fn snapshot(
+        infohash: &str,
+        progress_bytes: u64,
+        total_bytes: u64,
+    ) -> crate::engine::TorrentSnapshot {
+        crate::engine::TorrentSnapshot {
+            infohash: infohash.to_string(),
+            name: format!("torrent {infohash}"),
+            state: crate::engine::TorrentState::Downloading,
+            progress_bytes,
+            total_bytes,
+            download_speed: 1024,
+            upload_speed: 0,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn s_starts_the_highlighted_download() {
+        let mut a = app();
+        a.update(Action::QueueChanged(vec![entry("aa"), entry("bb")]));
+        a.set_section(Section::Downloads);
+        a.region = Region::Content;
+        let effects = a.update(Action::Key(KeyAction::StartDownload));
+        assert!(
+            effects.contains(&Effect::StartDownload("aa".to_string())),
+            "expected a start for the highlighted entry: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn p_pauses_the_highlighted_download() {
+        let mut a = app();
+        a.update(Action::QueueChanged(vec![entry("aa")]));
+        a.set_section(Section::Downloads);
+        a.region = Region::Content;
+        let effects = a.update(Action::Key(KeyAction::PauseDownload));
+        assert!(
+            effects.contains(&Effect::PauseDownload("aa".to_string())),
+            "expected a pause: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn start_and_pause_do_nothing_without_a_selection() {
+        let mut a = app();
+        assert!(a.update(Action::Key(KeyAction::StartDownload)).is_empty());
+        assert!(a.update(Action::Key(KeyAction::PauseDownload)).is_empty());
+    }
+
+    #[test]
+    fn snapshots_are_stored_for_the_downloads_panel() {
+        let mut a = app();
+        a.update(Action::SnapshotsUpdated(vec![snapshot("aa", 512, 1024)]));
+        assert_eq!(a.snapshots().len(), 1);
+        assert_eq!(a.snapshots()[0].progress_bytes, 512);
+    }
+
+    #[test]
+    fn the_guard_state_is_stored() {
+        use crate::vpn::guard::GuardState;
+        let mut a = app();
+        a.update(Action::GuardChanged(GuardState::Protected {
+            device: "utun4".into(),
+        }));
+        assert_eq!(
+            a.guard_state(),
+            &GuardState::Protected {
+                device: "utun4".to_string()
+            }
+        );
+    }
+
     #[test]
     fn quit_is_reachable_from_every_overlay_and_mode() {
         // map_key already produces Quit everywhere and a mapper-level test

@@ -230,6 +230,13 @@ fn perform(effect: Effect, app: &App, rt: &mut Runtime) -> Vec<Action> {
             }
             vec![Action::DownloadDirChanged(dir)]
         }
+
+        // Wiring these into a live session is a later milestone's job; this
+        // task only introduces the vocabulary the event loop will eventually
+        // act on. No socket, no session, nothing started here.
+        Effect::StartDownload(_) | Effect::PauseDownload(_) | Effect::RemoveDownload { .. } => {
+            Vec::new()
+        }
     }
 }
 

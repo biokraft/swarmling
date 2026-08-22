@@ -135,6 +135,8 @@ fn section_key(key: KeyEvent, section: Section) -> Option<KeyAction> {
         return match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Char('c')) => Some(KeyAction::RemoveEntry),
             (KeyModifiers::SHIFT, KeyCode::Char('C')) => Some(KeyAction::ClearQueue),
+            (KeyModifiers::NONE, KeyCode::Char('s')) => Some(KeyAction::StartDownload),
+            (KeyModifiers::NONE, KeyCode::Char('p')) => Some(KeyAction::PauseDownload),
             _ => None,
         };
     }
@@ -320,6 +322,20 @@ pub const HELP: &[Help] = &[
         "clear",
         "Clear the whole queue",
         KeyAction::ClearQueue,
+        QUEUE_CTX,
+    ),
+    cmd(
+        "s",
+        "start",
+        "Start the highlighted download",
+        KeyAction::StartDownload,
+        QUEUE_CTX,
+    ),
+    cmd(
+        "p",
+        "pause",
+        "Pause the highlighted download",
+        KeyAction::PauseDownload,
         QUEUE_CTX,
     ),
     cmd(
@@ -689,6 +705,24 @@ mod tests {
             "the detail view is already the opened row; the App handles no Enter there"
         );
         assert_eq!(map_key(ctrl('c'), ctx), Some(KeyAction::Quit));
+    }
+
+    #[test]
+    fn start_and_pause_are_each_reachable_from_a_real_key_in_the_downloads_section() {
+        // A binding the app handles but no key produces is exactly the kind
+        // of dead-but-looks-alive key this suite guards against.
+        let ctx = Context {
+            section: Section::Downloads,
+            ..list()
+        };
+        assert_eq!(
+            map_key(key(KeyCode::Char('s')), ctx),
+            Some(KeyAction::StartDownload)
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('p')), ctx),
+            Some(KeyAction::PauseDownload)
+        );
     }
 
     #[test]
