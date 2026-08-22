@@ -528,19 +528,88 @@ mod tests {
         }
     }
 
+    fn snapshot(
+        infohash: &str,
+        progress_bytes: u64,
+        total_bytes: u64,
+    ) -> crate::engine::TorrentSnapshot {
+        crate::engine::TorrentSnapshot {
+            infohash: infohash.to_owned(),
+            name: "snapshot".into(),
+            state: crate::engine::TorrentState::Downloading,
+            progress_bytes,
+            total_bytes,
+            download_speed: 4096,
+            upload_speed: 0,
+            error: None,
+        }
+    }
+
+    fn entry(infohash: &str) -> crate::download::queue::QueueEntry {
+        crate::download::queue::QueueEntry {
+            infohash: infohash.to_owned(),
+            magnet: "magnet:?xt=urn:btih:".to_owned() + infohash,
+            title: "a queued release".into(),
+            added_unix: 1_700_000_000,
+            paused: false,
+            source_id: None,
+            dir: None,
+        }
+    }
+
+    fn downloads_app(queue: Vec<crate::download::queue::QueueEntry>) -> App {
+        let mut a = App::new(std::path::PathBuf::from("/tmp/x"), queue);
+        a.update(Action::Key(KeyAction::Enter));
+        a.set_section(crate::tui::app::Section::Downloads);
+        a
+    }
+
     #[test]
-    fn the_downloads_panel_says_nothing_is_transferring() {
-        // There is no session in this milestone. A progress bar would be a
-        // lie, so the panel has to say why nothing is moving.
-        let text = downloads_screen(queue_entry("queued release", None));
-        assert!(text.contains("queued release"), "{text}");
+    fn a_downloading_entry_shows_its_progress() {
+        let mut a = downloads_app(vec![entry("aa")]);
+        a.update(Action::SnapshotsUpdated(vec![snapshot("aa", 512, 1024)]));
+        let text = text_of(&render(&a, 100, 30));
+        assert!(text.contains("50%"), "expected a percentage in:\n{text}");
+    }
+
+    #[test]
+    fn the_old_placeholder_is_gone() {
+        // The panel used to promise downloads "in a later release". They are
+        // in this release, and a UI that still says otherwise is lying.
+        let a = downloads_app(vec![entry("aa")]);
+        let text = text_of(&render(&a, 100, 30));
         assert!(
-            text.contains("queued — downloads start in a later release"),
-            "the read-only state is not explained: {text}"
+            !text.contains("later release"),
+            "stale promise still rendered:\n{text}"
         );
+    }
+
+    #[test]
+    fn a_queue_entry_with_no_snapshot_is_shown_idle_not_fabricated() {
+        // No live session for this entry: it must not claim a transfer that
+        // is not happening.
+        let a = downloads_app(vec![entry("aa")]);
+        let text = text_of(&render(&a, 100, 30));
         assert!(
             !text.contains('%'),
             "a progress figure was invented: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("idle") || text.to_lowercase().contains("queued"),
+            "no idle state shown: {text}"
+        );
+    }
+
+    #[test]
+    fn an_unprotected_tunnel_is_visible() {
+        let mut a = downloads_app(vec![entry("aa")]);
+        a.update(Action::GuardChanged(
+            crate::vpn::guard::GuardState::Unprotected,
+        ));
+        let text = text_of(&render(&a, 100, 30));
+        assert!(
+            text.to_lowercase().contains("vpn"),
+            "the user must be able to see they are unprotected:\n{text}"
         );
     }
 

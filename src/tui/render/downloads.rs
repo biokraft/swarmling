@@ -1,6 +1,7 @@
-//! The downloads panel. It is read-only by design: this milestone starts no
-//! session, so there is no progress to report. A progress bar here would be
-//! an invention, and the panel says so instead.
+//! The downloads panel: the queue, matched by infohash against whatever the
+//! live engine reports, plus the VPN guard's own status. An entry with no
+//! matching snapshot has no progress to show and is rendered idle — never a
+//! fabricated "downloading, 0%" row.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -8,13 +9,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use super::{added_label, empty, truncate};
+use super::{added_label, empty, human_size, truncate};
+use crate::engine::{TorrentSnapshot, TorrentState};
 use crate::tui::app::{App, Region};
 use crate::tui::layout::window_start;
-use crate::tui::theme::{icon, source_tag, ACCENT, ALT, BRIGHT, RULE, TEXT, WARN};
+use crate::tui::theme::{icon, source_tag, ACCENT, BAD, BRIGHT, GOOD, RULE, TEXT, WARN};
+use crate::vpn::guard::GuardState;
+use crate::vpn::policy::BindSupport;
 
 const CURSOR_BG: Color = Color::Rgb(0x2a, 0x22, 0x3d);
-const EXPLAINER: &str = "queued — downloads start in a later release";
 
 /// Each entry takes a title row and a detail row.
 const ROW_HEIGHT: usize = 2;
@@ -34,10 +37,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let width = inner.width as usize;
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-        truncate(EXPLAINER, width),
-        Style::default().fg(ALT),
-    ))];
+    let mut lines: Vec<Line> = vec![guard_line(app.guard_state(), std::env::consts::OS)];
 
     if app.queue.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -71,6 +71,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         // A pasted magnet came from no source, so it has no tag to show;
         // `source_tag` gives the neutral marker for that case.
         let (tag, tag_colour) = source_tag(entry.source_id.as_deref().unwrap_or(""));
+        let snapshot = app
+            .snapshots()
+            .iter()
+            .find(|s| s.infohash == entry.infohash);
         let mut detail = vec![
             Span::raw("  "),
             Span::styled(format!("{tag} "), Style::default().fg(tag_colour)),
@@ -84,6 +88,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(RULE),
             ),
         ];
+        detail.push(progress_span(snapshot));
         if entry.paused {
             detail.push(Span::styled(
                 format!(" {} paused", icon::PAUSE),
@@ -100,4 +105,75 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 /// entries apart without filling the row.
 fn short_hash(infohash: &str) -> String {
     infohash.chars().take(8).collect()
+}
+
+/// The state word for a snapshot's `TorrentState`.
+fn state_label(state: TorrentState) -> &'static str {
+    match state {
+        TorrentState::Checking => "checking",
+        TorrentState::Downloading => "downloading",
+        TorrentState::Seeding => "seeding",
+        TorrentState::Paused => "paused",
+        TorrentState::Errored => "errored",
+    }
+}
+
+/// Whole-number percent complete, guarding a zero denominator. `progress_bytes
+/// * 100` can overflow a `u64` for a very large torrent, so the multiply runs
+/// in `u128` before dividing back down; the result is always in `0..=100`,
+/// which fits a `u64` without loss.
+fn percent(progress_bytes: u64, total_bytes: u64) -> u64 {
+    if total_bytes == 0 {
+        return 0;
+    }
+    let capped = progress_bytes.min(total_bytes) as u128;
+    ((capped * 100) / total_bytes as u128) as u64
+}
+
+/// The detail-row span describing a queue entry's live progress, or its idle
+/// state when no snapshot exists for it yet.
+fn progress_span(snapshot: Option<&TorrentSnapshot>) -> Span<'static> {
+    match snapshot {
+        None => Span::styled(
+            " idle — not yet started".to_owned(),
+            Style::default().fg(RULE),
+        ),
+        Some(s) => {
+            let pct = percent(s.progress_bytes, s.total_bytes);
+            Span::styled(
+                format!(
+                    " {} {pct}% {} {}/s",
+                    state_label(s.state),
+                    icon::DOWN,
+                    human_size(s.download_speed)
+                ),
+                Style::default().fg(TEXT),
+            )
+        }
+    }
+}
+
+/// The persistent line describing the tunnel: whether it is up, and — on a
+/// platform that cannot bind traffic to an interface — that traffic is not
+/// pinned to the device even while protected.
+fn guard_line(guard: &GuardState, os: &str) -> Line<'static> {
+    let (text, colour) = match guard {
+        GuardState::Unprotected => ("VPN: not connected — nothing is protected".to_owned(), BAD),
+        GuardState::Protected { device } => (format!("VPN: connected via {device}"), GOOD),
+        GuardState::Lost { previous_device } => (
+            format!("VPN: lost ({previous_device}) — downloads are paused"),
+            BAD,
+        ),
+    };
+    let mut spans = vec![Span::styled(text, Style::default().fg(colour))];
+    if matches!(
+        crate::vpn::policy::bind_support_for(os),
+        BindSupport::Unsupported
+    ) {
+        spans.push(Span::styled(
+            " — traffic is not pinned to the tunnel device on this platform".to_owned(),
+            Style::default().fg(WARN),
+        ));
+    }
+    Line::from(spans)
 }
