@@ -195,10 +195,47 @@ impl Supervisor {
                 }
                 self.wanted.push(w);
             }
-            // Start, Pause and Remove arrive in the next task. Until then they
-            // change nothing, which is the safe direction: no session, no
-            // traffic.
-            Intent::Start(_) | Intent::Pause(_) | Intent::Remove { .. } => {}
+            Intent::Start(infohash) => {
+                let Some(w) = self.wanted.iter_mut().find(|w| w.infohash == infohash) else {
+                    return;
+                };
+                w.paused = false;
+                if matches!(self.protection, Protection::Unprotected) {
+                    ops.push(SessionOp::Notice(
+                        "no confirmed VPN tunnel, so nothing was started. \
+                         Connect your VPN and try again."
+                            .to_string(),
+                    ));
+                    return;
+                }
+                if self.in_session.contains(&infohash) {
+                    ops.push(SessionOp::ResumeTorrent(infohash));
+                }
+            }
+            Intent::Pause(infohash) => {
+                let Some(w) = self.wanted.iter_mut().find(|w| w.infohash == infohash) else {
+                    return;
+                };
+                w.paused = true;
+                if self.in_session.contains(&infohash) {
+                    ops.push(SessionOp::PauseTorrent(infohash));
+                }
+            }
+            Intent::Remove {
+                infohash,
+                delete_files,
+            } => {
+                if !self.wanted.iter().any(|w| w.infohash == infohash) {
+                    return;
+                }
+                self.wanted.retain(|w| w.infohash != infohash);
+                if self.in_session.remove(&infohash) {
+                    ops.push(SessionOp::RemoveTorrent {
+                        infohash,
+                        delete_files,
+                    });
+                }
+            }
         }
     }
 
@@ -428,5 +465,178 @@ mod tests {
             })),
             vec![]
         );
+    }
+
+    fn protected() -> Supervisor {
+        let mut s = Supervisor::new(BindSupport::Supported);
+        s.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }));
+        s
+    }
+
+    #[test]
+    fn adding_while_protected_builds_and_adds() {
+        let mut s = protected();
+        let ops = s.handle(Input::User(Intent::Add(wanted("aa"))));
+        assert_eq!(
+            ops,
+            vec![
+                SessionOp::Build {
+                    device: Some("utun4".to_string())
+                },
+                SessionOp::AddTorrent {
+                    infohash: "aa".to_string(),
+                    magnet: "magnet:?xt=urn:btih:aa".to_string(),
+                    dir: std::path::PathBuf::from("/downloads"),
+                    paused: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn adding_the_same_torrent_twice_adds_it_once() {
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        let ops = s.handle(Input::User(Intent::Add(wanted("aa"))));
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, SessionOp::AddTorrent { .. })),
+            "a second add of the same infohash must not add it again: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn starting_while_unprotected_refuses_and_builds_nothing() {
+        let mut s = Supervisor::new(BindSupport::Supported);
+        let mut paused = wanted("aa");
+        paused.paused = true;
+        s.handle(Input::User(Intent::Add(paused)));
+        let ops = s.handle(Input::User(Intent::Start("aa".into())));
+        assert!(
+            !ops.iter().any(|op| matches!(op, SessionOp::Build { .. })),
+            "pressing start without a tunnel must not build a session: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, SessionOp::Notice(_))),
+            "the refusal must be explained to the user: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn pausing_the_last_active_torrent_kills_the_session() {
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        let ops = s.handle(Input::User(Intent::Pause("aa".into())));
+        assert!(
+            ops.contains(&SessionOp::PauseTorrent("aa".to_string())),
+            "expected a pause: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, SessionOp::Kill { .. })),
+            "with nothing active the session must not be left open: {ops:?}"
+        );
+        assert_eq!(s.state(), &SessionState::Down);
+    }
+
+    #[test]
+    fn starting_a_paused_torrent_brings_the_session_back() {
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        s.handle(Input::User(Intent::Pause("aa".into())));
+        let ops = s.handle(Input::User(Intent::Start("aa".into())));
+        assert!(
+            ops.contains(&SessionOp::Build {
+                device: Some("utun4".to_string())
+            }),
+            "expected a rebuild: {ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, SessionOp::AddTorrent { infohash, .. } if infohash == "aa")),
+            "the restarted torrent must be re-added: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn removing_a_torrent_removes_it_and_forgets_it() {
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        s.handle(Input::User(Intent::Add(wanted("bb"))));
+        let ops = s.handle(Input::User(Intent::Remove {
+            infohash: "aa".into(),
+            delete_files: true,
+        }));
+        assert!(
+            ops.contains(&SessionOp::RemoveTorrent {
+                infohash: "aa".to_string(),
+                delete_files: true
+            }),
+            "expected a remove: {ops:?}"
+        );
+        assert_eq!(s.wanted().len(), 1);
+        assert_eq!(s.wanted()[0].infohash, "bb");
+    }
+
+    #[test]
+    fn a_finished_torrent_leaves_the_session_immediately() {
+        // Swarmling never seeds. This is the only place that is enforced.
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        let ops = s.handle(Input::Completed("aa".into()));
+        assert!(
+            ops.contains(&SessionOp::RemoveTorrent {
+                infohash: "aa".to_string(),
+                delete_files: false
+            }),
+            "a completed torrent must be removed, never seeded: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, SessionOp::Kill { .. })),
+            "the last torrent finishing must close the session: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_session_does_not_immediately_rebuild() {
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        let ops = s.handle(Input::SessionFailed("backend exploded".into()));
+        assert!(
+            !ops.iter().any(|op| matches!(op, SessionOp::Build { .. })),
+            "a failed session must not be retried in a loop: {ops:?}"
+        );
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, SessionOp::Notice(m) if m.contains("backend exploded"))));
+        assert_eq!(s.state(), &SessionState::Down);
+    }
+
+    #[test]
+    fn a_fresh_user_intent_clears_a_stall() {
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        s.handle(Input::SessionFailed("backend exploded".into()));
+        let ops = s.handle(Input::User(Intent::Start("aa".into())));
+        assert!(
+            ops.iter().any(|op| matches!(op, SessionOp::Build { .. })),
+            "an explicit user retry must be allowed to rebuild: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn intents_for_an_unknown_torrent_are_harmless() {
+        let mut s = protected();
+        assert_eq!(s.handle(Input::User(Intent::Start("zz".into()))), vec![]);
+        assert_eq!(s.handle(Input::User(Intent::Pause("zz".into()))), vec![]);
+        assert_eq!(
+            s.handle(Input::User(Intent::Remove {
+                infohash: "zz".into(),
+                delete_files: false
+            })),
+            vec![]
+        );
+        assert_eq!(s.handle(Input::Completed("zz".into())), vec![]);
     }
 }
