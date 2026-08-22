@@ -10,6 +10,9 @@ struct Inner {
     torrents: HashMap<InfoHash, TorrentSnapshot>,
     added_magnets: Vec<String>,
     fail_next_add: Option<String>,
+    fail_next_pause: Option<String>,
+    fail_next_resume: Option<String>,
+    fail_next_remove: Option<String>,
 }
 
 /// An in-memory stand-in for a real torrent backend. It never opens a socket
@@ -32,6 +35,21 @@ impl FakeEngine {
     /// Make the next `add_magnet` fail with a backend error, once.
     pub fn fail_next_add(&self, message: &str) {
         self.lock().fail_next_add = Some(message.to_string());
+    }
+
+    /// Make the next `pause` fail with a backend error, once.
+    pub fn fail_next_pause(&self, message: &str) {
+        self.lock().fail_next_pause = Some(message.to_string());
+    }
+
+    /// Make the next `resume` fail with a backend error, once.
+    pub fn fail_next_resume(&self, message: &str) {
+        self.lock().fail_next_resume = Some(message.to_string());
+    }
+
+    /// Make the next `remove` fail with a backend error, once.
+    pub fn fail_next_remove(&self, message: &str) {
+        self.lock().fail_next_remove = Some(message.to_string());
     }
 
     pub fn set_progress(&self, infohash: &str, progress_bytes: u64, total_bytes: u64) {
@@ -98,6 +116,9 @@ impl TorrentEngine for FakeEngine {
 
     async fn pause(&self, infohash: &str) -> Result<(), EngineError> {
         let mut inner = self.lock();
+        if let Some(message) = inner.fail_next_pause.take() {
+            return Err(EngineError::Backend(message));
+        }
         let t = inner
             .torrents
             .get_mut(infohash)
@@ -108,6 +129,9 @@ impl TorrentEngine for FakeEngine {
 
     async fn resume(&self, infohash: &str) -> Result<(), EngineError> {
         let mut inner = self.lock();
+        if let Some(message) = inner.fail_next_resume.take() {
+            return Err(EngineError::Backend(message));
+        }
         let t = inner
             .torrents
             .get_mut(infohash)
@@ -122,6 +146,9 @@ impl TorrentEngine for FakeEngine {
     }
 
     async fn remove(&self, infohash: &str, _delete_files: bool) -> Result<(), EngineError> {
+        if let Some(message) = self.lock().fail_next_remove.take() {
+            return Err(EngineError::Backend(message));
+        }
         self.lock()
             .torrents
             .remove(infohash)

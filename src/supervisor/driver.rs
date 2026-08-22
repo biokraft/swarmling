@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::engine::{TorrentEngine, TorrentSnapshot, TorrentState};
 use crate::supervisor::factory::SessionFactory;
-use crate::supervisor::state::{Input, SessionOp, Supervisor};
+use crate::supervisor::state::{FailedOp, Input, SessionOp, Supervisor};
 
 pub struct Driver {
     factory: Arc<dyn SessionFactory>,
@@ -67,7 +67,11 @@ impl Driver {
             match op {
                 SessionOp::Notice(message) => notices.push(message),
                 SessionOp::Kill { .. } => {
-                    // Dropping the last handle is what tears the session down.
+                    // Dropping the last handle (rather than calling
+                    // `Session::stop()`) is deliberate: it discards any
+                    // fastresume progress the engine might otherwise have
+                    // saved, but a kill switch has to be the one thing we
+                    // can be sure works, so we never wait on a graceful stop.
                     self.engine = None;
                 }
                 SessionOp::Build { device } => match self.factory.build(device.as_deref()).await {
@@ -82,16 +86,26 @@ impl Driver {
                     }
                 },
                 SessionOp::AddTorrent {
+                    infohash,
                     magnet,
                     dir,
                     paused,
-                    ..
                 } => {
                     let Some(engine) = self.engine.clone() else {
                         continue;
                     };
                     if let Err(e) = engine.add_magnet(&magnet, &dir, paused).await {
                         notices.push(format!("Could not start that download ({e})"));
+                        // Tell the supervisor the engine does not actually
+                        // have it, so it stops believing otherwise. `Add`
+                        // never emits another op that can itself fail, so
+                        // this cannot recurse further.
+                        let more = Box::pin(self.handle(Input::OpFailed {
+                            infohash,
+                            kind: FailedOp::Add,
+                        }))
+                        .await;
+                        notices.extend(more);
                     }
                 }
                 SessionOp::PauseTorrent(infohash) => {
@@ -100,6 +114,15 @@ impl Driver {
                     };
                     if let Err(e) = engine.pause(&infohash).await {
                         notices.push(format!("Could not pause that download ({e})"));
+                        // A pause we cannot confirm took effect must fail
+                        // closed: this feeds back to a `Kill`, which cannot
+                        // itself fail, so the recursion is bounded.
+                        let more = Box::pin(self.handle(Input::OpFailed {
+                            infohash,
+                            kind: FailedOp::Pause,
+                        }))
+                        .await;
+                        notices.extend(more);
                     }
                 }
                 SessionOp::ResumeTorrent(infohash) => {
@@ -108,6 +131,14 @@ impl Driver {
                     };
                     if let Err(e) = engine.resume(&infohash).await {
                         notices.push(format!("Could not resume that download ({e})"));
+                        // `Resume` only ever updates our own record and emits
+                        // no ops, so this cannot recurse further either.
+                        let more = Box::pin(self.handle(Input::OpFailed {
+                            infohash,
+                            kind: FailedOp::Resume,
+                        }))
+                        .await;
+                        notices.extend(more);
                     }
                 }
                 SessionOp::RemoveTorrent {
@@ -119,6 +150,14 @@ impl Driver {
                     };
                     if let Err(e) = engine.remove(&infohash, delete_files).await {
                         notices.push(format!("Could not remove that download ({e})"));
+                        // Same reasoning as the failed pause: fail closed via
+                        // `Kill`, which cannot itself fail.
+                        let more = Box::pin(self.handle(Input::OpFailed {
+                            infohash,
+                            kind: FailedOp::Remove,
+                        }))
+                        .await;
+                        notices.extend(more);
                     }
                 }
             }
@@ -278,5 +317,149 @@ mod tests {
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].progress_bytes, 512);
         assert_eq!(snaps[0].total_bytes, 1024);
+    }
+
+    const AA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BB: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[tokio::test]
+    async fn a_failed_add_is_retried_once_the_supervisor_reconciles_again() {
+        let f = Arc::new(FakeFactory::new());
+        let mut d = driver(Arc::clone(&f));
+        d.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }))
+        .await;
+        d.handle(Input::User(Intent::Add(wanted(AA)))).await;
+
+        f.engine().fail_next_add("disk on fire");
+        let notices = d.handle(Input::User(Intent::Add(wanted(BB)))).await;
+        assert!(
+            notices.iter().any(|n| n.contains("disk on fire")),
+            "the failure must reach the user: {notices:?}"
+        );
+        assert_eq!(
+            f.engine().added_magnets(),
+            vec![format!("magnet:?xt=urn:btih:{AA}")],
+            "bb's add failed and must not appear as added"
+        );
+
+        // An unrelated intent (pausing aa, which stays active because bb is
+        // still wanted) forces a reconcile with no kill involved. If the
+        // supervisor still believed bb was in the session, this would add
+        // nothing further; the fix is what makes it retry bb.
+        d.handle(Input::User(Intent::Pause(AA.to_string()))).await;
+        assert_eq!(
+            f.engine().added_magnets(),
+            vec![
+                format!("magnet:?xt=urn:btih:{AA}"),
+                format!("magnet:?xt=urn:btih:{BB}"),
+            ],
+            "the supervisor must retry the add it thinks never landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_pause_kills_the_session() {
+        let f = Arc::new(FakeFactory::new());
+        let mut d = driver(Arc::clone(&f));
+        d.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }))
+        .await;
+        // Two active torrents, so pausing one does not, by itself, empty the
+        // "wanted" set and trigger the ordinary nothing-left-to-download
+        // kill; any kill we see must come from the failed-pause handling.
+        d.handle(Input::User(Intent::Add(wanted(AA)))).await;
+        d.handle(Input::User(Intent::Add(wanted(BB)))).await;
+        assert!(d.session_is_live());
+
+        f.engine().fail_next_pause("backend wedged");
+        let notices = d.handle(Input::User(Intent::Pause(AA.to_string()))).await;
+        assert!(
+            notices.iter().any(|n| n.contains("backend wedged")),
+            "the failure must reach the user: {notices:?}"
+        );
+        assert!(
+            !d.session_is_live(),
+            "a pause we cannot confirm must fail closed by killing the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_remove_kills_the_session() {
+        let f = Arc::new(FakeFactory::new());
+        let mut d = driver(Arc::clone(&f));
+        d.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }))
+        .await;
+        // Two active torrents, same reasoning as the failed-pause test: bb
+        // stays wanted, so removing aa alone would not naturally kill the
+        // session unless the failed-remove handling does it explicitly.
+        d.handle(Input::User(Intent::Add(wanted(AA)))).await;
+        d.handle(Input::User(Intent::Add(wanted(BB)))).await;
+        assert!(d.session_is_live());
+
+        f.engine().fail_next_remove("backend wedged");
+        let notices = d
+            .handle(Input::User(Intent::Remove {
+                infohash: AA.to_string(),
+                delete_files: false,
+            }))
+            .await;
+        assert!(
+            notices.iter().any(|n| n.contains("backend wedged")),
+            "the failure must reach the user: {notices:?}"
+        );
+        assert!(
+            !d.session_is_live(),
+            "a remove we cannot confirm must fail closed by killing the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_resume_marks_the_entry_paused_again() {
+        let f = Arc::new(FakeFactory::new());
+        let mut d = driver(Arc::clone(&f));
+        d.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }))
+        .await;
+        // A second, unrelated active torrent keeps the session alive while
+        // aa is paused, so the resume path (not a rebuild from scratch) is
+        // what actually gets exercised.
+        d.handle(Input::User(Intent::Add(wanted(AA)))).await;
+        d.handle(Input::User(Intent::Add(wanted(BB)))).await;
+        d.handle(Input::User(Intent::Pause(AA.to_string()))).await;
+
+        f.engine().fail_next_resume("backend wedged");
+        let notices = d.handle(Input::User(Intent::Start(AA.to_string()))).await;
+        assert!(
+            notices.iter().any(|n| n.contains("backend wedged")),
+            "the failure must reach the user: {notices:?}"
+        );
+
+        // Kill and rebuild the session; if the record still says paused (as
+        // it must, since the resume never actually took effect), the
+        // rebuild re-adds it paused rather than downloading.
+        d.handle(Input::Vpn(GuardAction::PauseAll {
+            reason: "gone".into(),
+        }))
+        .await;
+        d.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }))
+        .await;
+        let snaps = d.snapshots().await;
+        let aa_snap = snaps
+            .iter()
+            .find(|s| s.infohash == AA)
+            .expect("aa must still be wanted and rebuilt");
+        assert_eq!(
+            aa_snap.state,
+            TorrentState::Paused,
+            "a failed resume must leave the entry paused so a rebuild does not resume it"
+        );
     }
 }

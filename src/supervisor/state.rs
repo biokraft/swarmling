@@ -36,12 +36,23 @@ pub enum Intent {
     },
 }
 
+/// Which engine call failed, fed back by the driver so the supervisor's view
+/// of the session stays honest about what the engine actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedOp {
+    Add,
+    Pause,
+    Resume,
+    Remove,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
     Vpn(GuardAction),
     User(Intent),
     Completed(InfoHash),
     SessionFailed(String),
+    OpFailed { infohash: InfoHash, kind: FailedOp },
 }
 
 /// An instruction for the driver. Every variant is safe to execute at the
@@ -133,6 +144,45 @@ impl Supervisor {
                 self.in_session.clear();
                 self.stalled = true;
                 ops.push(SessionOp::Notice(message));
+                return ops;
+            }
+            Input::OpFailed { infohash, kind } => {
+                // The driver already told the user what failed; this only
+                // keeps our view of the session honest about what the engine
+                // actually did. Every arm returns immediately, without a
+                // general reconcile, so a failure here can never itself
+                // trigger another op that might fail — a `Kill` cannot fail,
+                // and the `Add` arm only ever re-tries on a later, unrelated
+                // input.
+                match kind {
+                    FailedOp::Add => {
+                        // The engine does not have it after all; the user
+                        // still wants it, so leave it in `wanted` but stop
+                        // pretending it is in the session, and don't retry in
+                        // a loop until something fresh happens.
+                        self.in_session.remove(&infohash);
+                        self.stalled = true;
+                    }
+                    FailedOp::Pause | FailedOp::Remove => {
+                        // We asked the engine to stop carrying a torrent and
+                        // it refused. We can no longer be sure what the
+                        // engine is doing, so fail closed: kill the session
+                        // rather than risk it carrying on unnoticed.
+                        let verb = if matches!(kind, FailedOp::Pause) {
+                            "pause"
+                        } else {
+                            "remove"
+                        };
+                        self.kill(format!("failed to {verb} torrent {infohash}"), &mut ops);
+                        self.stalled = true;
+                    }
+                    FailedOp::Resume => {
+                        // It did not actually resume; say so.
+                        if let Some(w) = self.wanted.iter_mut().find(|w| w.infohash == infohash) {
+                            w.paused = true;
+                        }
+                    }
+                }
                 return ops;
             }
         }
@@ -670,5 +720,88 @@ mod tests {
             vec![]
         );
         assert_eq!(s.handle(Input::Completed("zz".into())), vec![]);
+    }
+
+    #[test]
+    fn a_failed_add_forgets_the_engine_has_it_but_keeps_wanting_it() {
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        // The reconcile above emitted AddTorrent and optimistically marked
+        // "aa" in_session; now the driver reports it actually failed.
+        s.handle(Input::OpFailed {
+            infohash: "aa".into(),
+            kind: FailedOp::Add,
+        });
+        // Still wanted, so a fresh VPN bind (which forces a full reconcile
+        // via kill+rebuild) must try to add it again.
+        let ops = s.handle(Input::Vpn(GuardAction::Rebind {
+            device: "utun9".into(),
+        }));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, SessionOp::AddTorrent { infohash, .. } if infohash == "aa")),
+            "a torrent whose add failed must still be retried once reconnected: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_add_does_not_immediately_retry_in_the_same_batch() {
+        let mut s = protected();
+        let ops = s.handle(Input::OpFailed {
+            infohash: "aa".into(),
+            kind: FailedOp::Add,
+        });
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, SessionOp::AddTorrent { .. })),
+            "a failed add must not be retried immediately: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_pause_kills_the_session() {
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        let ops = s.handle(Input::OpFailed {
+            infohash: "aa".into(),
+            kind: FailedOp::Pause,
+        });
+        assert!(
+            ops.iter().any(|op| matches!(op, SessionOp::Kill { .. })),
+            "a pause we cannot be sure took effect must fail closed: {ops:?}"
+        );
+        assert_eq!(s.state(), &SessionState::Down);
+    }
+
+    #[test]
+    fn a_failed_remove_kills_the_session() {
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        let ops = s.handle(Input::OpFailed {
+            infohash: "aa".into(),
+            kind: FailedOp::Remove,
+        });
+        assert!(
+            ops.iter().any(|op| matches!(op, SessionOp::Kill { .. })),
+            "a remove we cannot be sure took effect must fail closed: {ops:?}"
+        );
+        assert_eq!(s.state(), &SessionState::Down);
+    }
+
+    #[test]
+    fn a_failed_resume_marks_the_entry_paused_again() {
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        s.handle(Input::User(Intent::Pause("aa".into())));
+        s.handle(Input::User(Intent::Start("aa".into())));
+        let ops = s.handle(Input::OpFailed {
+            infohash: "aa".into(),
+            kind: FailedOp::Resume,
+        });
+        assert_eq!(ops, vec![], "the driver already notified the user");
+        assert!(
+            s.wanted().iter().any(|w| w.infohash == "aa" && w.paused),
+            "the record must reflect that it did not actually resume"
+        );
     }
 }
