@@ -255,6 +255,18 @@ async fn main() -> anyhow::Result<()> {
                 cfg.vpn_required = value == "on";
                 settings::save(&path, &cfg)?;
                 println!("vpn_required: {}", cfg.vpn_required);
+                if !cfg.vpn_required {
+                    // The setting only reaches the command-line download path.
+                    // The terminal UI watches the tunnel itself and will not
+                    // start or keep a transfer without one, whatever this file
+                    // says, so saving in silence would read as a promise that
+                    // is not kept.
+                    println!(
+                        "note: this affects the command line only. The terminal UI still \
+                         requires a confirmed VPN tunnel before it will start a transfer, \
+                         and still stops every transfer if the tunnel goes away."
+                    );
+                }
             }
         },
     }
