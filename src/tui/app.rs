@@ -753,7 +753,17 @@ impl App {
                 if self.section != Section::Downloads || self.queue.is_empty() {
                     return Vec::new();
                 }
-                vec![Effect::ClearQueue]
+                // Emptying the file is only half of it: a transfer already in
+                // the session would keep running with no row left to pause or
+                // remove it by. `delete_files` stays false for the same reason
+                // as a single removal — clearing a list is not consent to
+                // delete what has already landed on disk.
+                let mut effects = vec![Effect::ClearQueue];
+                effects.extend(self.queue.iter().map(|e| Effect::RemoveDownload {
+                    infohash: e.infohash.clone(),
+                    delete_files: false,
+                }));
+                effects
             }
             KeyAction::StartDownload => {
                 if self.section != Section::Downloads {
@@ -995,6 +1005,30 @@ mod tests {
             ),
             "{effects:?}"
         );
+    }
+
+    #[test]
+    fn clearing_the_queue_also_clears_the_live_session() {
+        // Emptying the file alone would leave the engine downloading rows the
+        // user can no longer see, with nothing left to pause or remove.
+        let mut a = App::new(
+            PathBuf::from("/tmp"),
+            vec![entry(&"aa".repeat(20)), entry(&"bb".repeat(20))],
+        );
+        a.update(Action::Key(KeyAction::Enter));
+        a.set_section(Section::Downloads);
+        a.region = Region::Content;
+        let effects = a.update(Action::Key(KeyAction::ClearQueue));
+        assert!(effects.contains(&Effect::ClearQueue), "{effects:?}");
+        for hash in ["aa".repeat(20), "bb".repeat(20)] {
+            assert!(
+                effects.contains(&Effect::RemoveDownload {
+                    infohash: hash,
+                    delete_files: false,
+                }),
+                "every cleared row must leave the session too: {effects:?}"
+            );
+        }
     }
 
     #[test]
