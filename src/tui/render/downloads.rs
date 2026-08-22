@@ -23,6 +23,16 @@ const CURSOR_BG: Color = Color::Rgb(0x2a, 0x22, 0x3d);
 const ROW_HEIGHT: usize = 2;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
+    draw_with_os(frame, area, app, std::env::consts::OS);
+}
+
+/// The real render entry point, with the OS pulled out as a parameter so the
+/// row-budget math against a two-line, `BindSupport::Unsupported` header can
+/// be driven directly in tests without needing to run on that platform.
+/// `draw` always calls this with the real `std::env::consts::OS`; it stays a
+/// pure function of `&App` (plus the OS name, a compile-time platform
+/// property, not IO/clock/filesystem access).
+pub(crate) fn draw_with_os(frame: &mut Frame, area: Rect, app: &App, os: &str) {
     if empty(area) {
         return;
     }
@@ -37,7 +47,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let width = inner.width as usize;
-    let mut lines: Vec<Line> = guard_lines(app.guard_state(), std::env::consts::OS);
+    let header = guard_lines(app.guard_state(), os);
+    let header_height = header.len() as u16;
+    let mut lines: Vec<Line> = header;
 
     if app.queue.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -48,7 +60,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let room = (inner.height.saturating_sub(1) as usize) / ROW_HEIGHT;
+    let room = (inner.height.saturating_sub(header_height) as usize) / ROW_HEIGHT;
     let start = window_start(app.queue_cursor, app.queue.len(), room);
     let focused = app.region == Region::Content;
 

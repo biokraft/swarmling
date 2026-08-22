@@ -667,6 +667,63 @@ mod tests {
     }
 
     #[test]
+    fn the_row_budget_accounts_for_a_two_line_header() {
+        // On a BindSupport::Unsupported platform, guard_lines returns TWO
+        // lines (status + note). If the row budget still assumes a one-line
+        // header (the old hardcoded `- 1`), it overcounts by one row's worth
+        // of height and the last download row is truncated or overlaps the
+        // block border. Height chosen so a two-row entry only just fits
+        // above a two-line header, but not above a one-line header's
+        // (wrongly) larger budget.
+        //
+        // inner height = 24 - 2 (borders) = 22.
+        // With a 2-line header: room = (22 - 2) / 2 = 10 rows fit.
+        // With the old, wrong 1-line assumption: room = (22 - 1) / 2 = 10
+        // (rounds down the same here) -- so this exact height doesn't
+        // distinguish them; use a height where the two disagree instead.
+        let entries: Vec<_> = (0..12)
+            .map(|i| entry_titled(&format!("{i:040x}"), &format!("row {i}")))
+            .collect();
+        let mut a = downloads_app(entries);
+        a.update(Action::GuardChanged(
+            crate::vpn::guard::GuardState::Protected {
+                device: "wg0".into(),
+            },
+        ));
+        // inner height = 25 - 2 = 23.
+        // Two-line header: room = (23 - 2) / 2 = 10, so rows 0..10 fit,
+        // "row 9" is the last full row and must be fully present.
+        // One-line assumption: room = (23 - 1) / 2 = 11, one row too many is
+        // attempted, overrunning the block and corrupting "row 9"'s line.
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).expect("test backend");
+        // Render the downloads panel directly (outer area including its own
+        // border), with the OS pinned to "windows" so the
+        // BindSupport::Unsupported, two-line header path runs regardless of
+        // the platform this test actually executes on.
+        let panel = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 25,
+        };
+        terminal
+            .draw(|f| crate::tui::render::downloads::draw_with_os(f, panel, &a, "windows"))
+            .expect("draw");
+        let text = text_of(&terminal.backend().buffer().clone());
+        assert!(
+            text.contains("row 9"),
+            "the last row that should fit was lost or corrupted by an \
+             oversized row budget:\n{text}"
+        );
+        assert!(
+            !text.contains("row 10"),
+            "a row beyond the true budget was drawn, meaning the budget did \
+             not account for the two-line header:\n{text}"
+        );
+    }
+
+    #[test]
     fn the_bind_unsupported_note_survives_a_narrow_panel() {
         // Render the guard lines directly at a width too small to hold the
         // status text and the note concatenated on one line — this drives
