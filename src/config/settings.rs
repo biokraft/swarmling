@@ -17,7 +17,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            vpn_required: false,
+            vpn_required: true,
             vpn_adapter: "generic".into(),
             download_dir: None,
         }
@@ -150,9 +150,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_off_and_generic() {
+    fn defaults_are_on_and_generic() {
         let s = Settings::default();
-        assert!(!s.vpn_required);
+        assert!(s.vpn_required);
         assert_eq!(s.vpn_adapter, "generic");
         assert_eq!(s.download_dir, None);
     }
@@ -240,5 +240,12 @@ mod tests {
         let path = dir.path().join("old.json");
         std::fs::write(&path, br#"{"version":1}"#).unwrap();
         assert_eq!(load(&path), Settings::default());
+    }
+
+    #[test]
+    fn a_vpn_is_required_by_default() {
+        // Downloading unprotected must never be what happens when the user has
+        // expressed no preference. Absent a setting, assume protection is wanted.
+        assert!(Settings::default().vpn_required);
     }
 }
