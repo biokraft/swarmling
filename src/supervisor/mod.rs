@@ -6,6 +6,7 @@
 //! `vpn::guard` does. That is what makes them reachable by tests that cannot
 //! possibly start a transfer.
 
+pub mod driver;
 pub mod factory;
 pub mod state;
 
