@@ -234,8 +234,17 @@ fn perform(effect: Effect, app: &App, rt: &mut Runtime) -> Vec<Action> {
         // Wiring these into a live session is a later milestone's job; this
         // task only introduces the vocabulary the event loop will eventually
         // act on. No socket, no session, nothing started here.
+        //
+        // TRIPWIRE: the wiring task MUST delete this arm (replacing it with
+        // real session calls) and delete the covering test
+        // `the_session_effects_are_still_stubbed_out` in this module's test
+        // suite. Leaving either behind would mean `s`/`p` silently do
+        // nothing forever, which is exactly the defect this stub exists to
+        // avoid — see the notice below.
         Effect::StartDownload(_) | Effect::PauseDownload(_) | Effect::RemoveDownload { .. } => {
-            Vec::new()
+            vec![Action::Notice(
+                "Live transfers are not available yet".to_string(),
+            )]
         }
     }
 }
@@ -427,6 +436,46 @@ mod tests {
         // panic.
         restore_terminal_best_effort();
         restore_terminal_best_effort();
+    }
+
+    #[test]
+    fn the_session_effects_are_still_stubbed_out() {
+        // TRIPWIRE: this test exists to fail loudly the day someone wires
+        // Effect::{StartDownload,PauseDownload,RemoveDownload} into a real
+        // session and forgets to delete the stub arm in `perform`. Until
+        // then, pressing the keys that produce these effects must tell the
+        // user why nothing happened rather than silently doing nothing — the
+        // defect a prior milestone shipped five times over.
+        //
+        // When the wiring task lands, DELETE this test along with the stub
+        // arm in `perform` that it covers.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut rt = Runtime {
+            queue_path: dir.path().join("queue.json"),
+            settings_path: dir.path().join("settings.json"),
+            health: HashMap::new(),
+            search: None,
+            quit: false,
+        };
+        let app = App::new(dir.path().to_path_buf(), Vec::new());
+
+        for effect in [
+            Effect::StartDownload("a".repeat(40)),
+            Effect::PauseDownload("a".repeat(40)),
+            Effect::RemoveDownload {
+                infohash: "a".repeat(40),
+                delete_files: false,
+            },
+        ] {
+            let actions = perform(effect, &app, &mut rt);
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [Action::Notice(n)] if n == "Live transfers are not available yet"
+                ),
+                "a stubbed session effect must say so, not do nothing: {actions:?}"
+            );
+        }
     }
 
     #[test]

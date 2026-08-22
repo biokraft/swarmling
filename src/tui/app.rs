@@ -1341,7 +1341,12 @@ mod tests {
 
     #[test]
     fn start_and_pause_do_nothing_without_a_selection() {
+        // In the Downloads section with an empty queue, so this actually
+        // reaches the `queue.get(self.queue_cursor)` guard rather than
+        // exiting earlier on the section check.
         let mut a = app();
+        a.set_section(Section::Downloads);
+        a.region = Region::Content;
         assert!(a.update(Action::Key(KeyAction::StartDownload)).is_empty());
         assert!(a.update(Action::Key(KeyAction::PauseDownload)).is_empty());
     }
