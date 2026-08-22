@@ -6,6 +6,8 @@
 //! `vpn::guard` does. That is what makes them reachable by tests that cannot
 //! possibly start a transfer.
 
+pub mod factory;
 pub mod state;
 
+pub use factory::SessionFactory;
 pub use state::{Input, Intent, SessionOp, SessionState, Supervisor, Wanted};
