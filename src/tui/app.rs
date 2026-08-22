@@ -755,15 +755,11 @@ impl App {
                 }
                 // Emptying the file is only half of it: a transfer already in
                 // the session would keep running with no row left to pause or
-                // remove it by. `delete_files` stays false for the same reason
-                // as a single removal — clearing a list is not consent to
-                // delete what has already landed on disk.
-                let mut effects = vec![Effect::ClearQueue];
-                effects.extend(self.queue.iter().map(|e| Effect::RemoveDownload {
-                    infohash: e.infohash.clone(),
-                    delete_files: false,
-                }));
-                effects
+                // remove it by. One effect, not one per row — the loop caps
+                // the work a single action may cause, and a long queue ran
+                // past that cap. Nothing on disk is deleted, exactly as a
+                // single removal leaves files alone.
+                vec![Effect::ClearQueue, Effect::ClearDownloads]
             }
             KeyAction::StartDownload => {
                 if self.section != Section::Downloads {
@@ -1019,16 +1015,14 @@ mod tests {
         a.set_section(Section::Downloads);
         a.region = Region::Content;
         let effects = a.update(Action::Key(KeyAction::ClearQueue));
-        assert!(effects.contains(&Effect::ClearQueue), "{effects:?}");
-        for hash in ["aa".repeat(20), "bb".repeat(20)] {
-            assert!(
-                effects.contains(&Effect::RemoveDownload {
-                    infohash: hash,
-                    delete_files: false,
-                }),
-                "every cleared row must leave the session too: {effects:?}"
-            );
-        }
+        // Two effects whatever the queue holds. One removal per row would
+        // grow with the queue and run past the cap the loop puts on the work
+        // a single action may cause.
+        assert_eq!(
+            effects,
+            vec![Effect::ClearQueue, Effect::ClearDownloads],
+            "clearing is one instruction to the file and one to the session"
+        );
     }
 
     #[test]

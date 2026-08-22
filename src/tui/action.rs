@@ -105,6 +105,10 @@ pub enum Effect {
         infohash: String,
         delete_files: bool,
     },
+    /// Take everything out of the live session at once. One effect rather than
+    /// one removal per row: the loop caps the work a single action may cause,
+    /// and a long queue used to run past that cap.
+    ClearDownloads,
     CopyToClipboard(String),
     SaveDownloadDir(PathBuf),
     Quit,

@@ -295,6 +295,9 @@ async fn perform_session(effect: Effect, app: &App, session: &mut Session) -> Ve
                 .await,
             );
         }
+        Effect::ClearDownloads => {
+            actions.extend(handle_bounded(session, Input::User(Intent::ClearAll)).await);
+        }
         // Every other effect is `perform`'s. The caller routes by variant,
         // so getting here means a variant was routed to this function and
         // then never handled — loud in a debug build rather than silently
@@ -469,9 +472,10 @@ fn perform(effect: Effect, app: &App, rt: &mut Runtime) -> Vec<Action> {
         // Handled by `perform_session`, which awaits a real driver. The
         // caller routes them there; reaching this arm would mean the routing
         // was lost, so it does nothing rather than pretending to.
-        Effect::StartDownload(_) | Effect::PauseDownload(_) | Effect::RemoveDownload { .. } => {
-            Vec::new()
-        }
+        Effect::StartDownload(_)
+        | Effect::PauseDownload(_)
+        | Effect::RemoveDownload { .. }
+        | Effect::ClearDownloads => Vec::new(),
     }
 }
 
@@ -545,7 +549,8 @@ async fn dispatch(action: Action, app: &mut App, rt: &mut Runtime, session: &mut
                 }
                 Effect::StartDownload(_)
                 | Effect::PauseDownload(_)
-                | Effect::RemoveDownload { .. } => {
+                | Effect::RemoveDownload { .. }
+                | Effect::ClearDownloads => {
                     pending.extend(perform_session(effect, app, session).await);
                 }
                 effect => pending.extend(perform(effect, app, rt)),
@@ -682,6 +687,8 @@ async fn event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::action::KeyAction;
+    use crate::tui::app::{Region, Section};
     use crate::vpn::guard::GuardState;
     use crate::vpn::policy::BindSupport;
 
@@ -1175,6 +1182,76 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::GuardChanged(GuardState::Lost { .. }))),
             "the guard must still be observing after a stuck engine call: {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_large_queue_leaves_no_torrent_behind() {
+        // The clear used to fan out to one removal per row. `dispatch` caps
+        // the work one action may cause, so a queue past that cap lost the
+        // tail: rows vanished from the file while their torrents stayed in the
+        // session, with nothing left on screen to stop them by. A big queue is
+        // exactly the queue a user would clear.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (factory, mut session) = fake_session(interfaces);
+        let entries: Vec<QueueEntry> = (0..100)
+            .map(|i| queued(&format!("{i:040}"), None))
+            .collect();
+        let mut app = App::new(dir.path().to_path_buf(), entries.clone());
+        let mut rt = Runtime {
+            queue_path: dir.path().join("queue.json"),
+            settings_path: dir.path().join("settings.json"),
+            health: HashMap::new(),
+            search: None,
+            quit: false,
+        };
+
+        poll_vpn(&mut session).await;
+        for entry in &entries {
+            perform_session(
+                Effect::StartDownload(entry.infohash.clone()),
+                &app,
+                &mut session,
+            )
+            .await;
+        }
+        assert_eq!(factory.engine().added_magnets().len(), 100);
+        assert!(session.driver.session_is_live());
+
+        app.update(Action::Key(KeyAction::Enter));
+        app.set_section(Section::Downloads);
+        app.region = Region::Content;
+        dispatch(
+            Action::Key(KeyAction::ClearQueue),
+            &mut app,
+            &mut rt,
+            &mut session,
+        )
+        .await;
+
+        for entry in &entries {
+            assert!(
+                !session.driver.knows(&entry.infohash),
+                "{} was left in the session after a clear",
+                entry.infohash
+            );
+        }
+        assert!(
+            !session.driver.session_is_live(),
+            "a cleared queue must leave no session running"
+        );
+        assert!(app.queue.is_empty(), "the panel must show the queue empty");
+        assert!(
+            app.snapshots().is_empty(),
+            "the panel must not still be showing transfers that are gone: {} left",
+            app.snapshots().len()
+        );
+        assert!(
+            load_entries(&rt.queue_path).is_empty(),
+            "the queue file must have been rewritten empty"
         );
     }
 

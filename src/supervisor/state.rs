@@ -34,6 +34,10 @@ pub enum Intent {
         infohash: InfoHash,
         delete_files: bool,
     },
+    /// Stop wanting anything at all. The reconcile below tears the session
+    /// down on its own once nothing is wanted, so this needs no separate
+    /// instruction and no reach into the engine.
+    ClearAll,
 }
 
 /// Which engine call failed, fed back by the driver so the supervisor's view
@@ -276,6 +280,17 @@ impl Supervisor {
                 w.paused = true;
                 if self.in_session.contains(&infohash) {
                     ops.push(SessionOp::PauseTorrent(infohash));
+                }
+            }
+            Intent::ClearAll => {
+                // Files already on disk are left alone, exactly as a single
+                // removal does: clearing a list is not consent to delete them.
+                self.wanted.clear();
+                for infohash in std::mem::take(&mut self.in_session) {
+                    ops.push(SessionOp::RemoveTorrent {
+                        infohash,
+                        delete_files: false,
+                    });
                 }
             }
             Intent::Remove {
@@ -634,6 +649,29 @@ mod tests {
         );
         assert_eq!(s.wanted().len(), 1);
         assert_eq!(s.wanted()[0].infohash, "bb");
+    }
+
+    #[test]
+    fn clearing_everything_empties_the_session_and_keeps_the_files() {
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        s.handle(Input::User(Intent::Add(wanted("bb"))));
+        let ops = s.handle(Input::User(Intent::ClearAll));
+
+        assert!(s.wanted().is_empty(), "nothing may still be wanted");
+        for infohash in ["aa", "bb"] {
+            assert!(
+                ops.contains(&SessionOp::RemoveTorrent {
+                    infohash: infohash.to_string(),
+                    delete_files: false
+                }),
+                "{infohash} must be taken out of the session, files left alone: {ops:?}"
+            );
+        }
+        assert!(
+            ops.iter().any(|op| matches!(op, SessionOp::Kill { .. })),
+            "a session carrying nothing must not be held open: {ops:?}"
+        );
     }
 
     #[test]
