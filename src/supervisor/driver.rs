@@ -110,26 +110,35 @@ impl Driver {
     /// on its own. So the drop comes first, and the supervisor is told after,
     /// when its view already matches reality.
     pub async fn force_kill(&mut self, reason: &str) -> Vec<String> {
+        // Same load-bearing assumption as the `Kill` op below: the transfer
+        // stops because this was the last `Arc<dyn TorrentEngine>` and
+        // librqbit ends its own tasks when the session handle goes. Untestable
+        // under the hard rule; see the longer note at that site.
         self.engine = None;
         self.handle(Input::SessionFailed(reason.to_string())).await
     }
 
-    /// Ask the engine what finished, and tell the supervisor. This is what
-    /// enforces "never seed": a torrent that reaches `Seeding` is on its way
-    /// out of the session.
-    pub async fn poll_completions(&mut self) -> Vec<String> {
-        let finished: Vec<String> = self
-            .snapshots()
+    /// Which torrents the engine says have finished. A read and nothing else:
+    /// `&self`, no supervisor call, no engine instruction.
+    ///
+    /// The split is deliberate and it is safety-critical. Detection and
+    /// mutation used to happen together here, under whatever bound the caller
+    /// put around the pair. `Supervisor::handle(Input::Completed)` forgets a
+    /// torrent synchronously, before the removal it asks for has been carried
+    /// out, so a bound that cancelled the pair mid-way consumed the completion
+    /// and left the engine seeding a torrent nobody believed was there — and
+    /// the next tick would report it finished again to a supervisor that no
+    /// longer knew it, emitting no removal at all. Handing each infohash back
+    /// to the caller means the completion travels the same fail-closed path as
+    /// every other input: a removal that does not answer becomes
+    /// `FailedOp::Remove`, which kills the session.
+    pub async fn finished(&self) -> Vec<String> {
+        self.snapshots()
             .await
             .into_iter()
             .filter(|s| s.state == TorrentState::Seeding)
             .map(|s| s.infohash)
-            .collect();
-        let mut notices = Vec::new();
-        for infohash in finished {
-            notices.extend(self.handle(Input::Completed(infohash)).await);
-        }
-        notices
+            .collect()
     }
 
     async fn execute(&mut self, ops: Vec<SessionOp>) -> Vec<String> {
@@ -143,6 +152,16 @@ impl Driver {
                     // fastresume progress the engine might otherwise have
                     // saved, but a kill switch has to be the one thing we
                     // can be sure works, so we never wait on a graceful stop.
+                    //
+                    // LOAD-BEARING ASSUMPTION, and the one thing here that no
+                    // test can check: this stops the transfer only if dropping
+                    // the last `Arc<dyn TorrentEngine>` really does end
+                    // librqbit's internal tasks. Verifying it would mean
+                    // running a live session, which the project's hard rule
+                    // forbids, so it rests on librqbit's ownership model and
+                    // on a maintainer confirming it by hand. If that ever
+                    // stops holding, every kill switch in this crate stops
+                    // working and nothing here will say so.
                     self.engine = None;
                 }
                 SessionOp::Build { device } => {
@@ -394,7 +413,9 @@ mod tests {
         .await;
         let infohash = f.engine().snapshots().await[0].infohash.clone();
         f.engine().finish(&infohash);
-        d.poll_completions().await;
+        for infohash in d.finished().await {
+            d.handle(Input::Completed(infohash)).await;
+        }
         assert!(
             f.engine().snapshots().await.is_empty(),
             "a completed torrent must leave the session rather than seed"

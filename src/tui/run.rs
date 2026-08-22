@@ -55,7 +55,8 @@ const TICK: Duration = Duration::from_millis(250);
 /// latency. Every branch of the loop runs in one task, so a wedged backend
 /// delays this tick by whatever the branch ahead of it is waiting on:
 ///
-/// - a stalled snapshot poll: up to `2 × ENGINE_POLL_LIMIT`, so about 12s;
+/// - a stalled snapshot poll: up to `2 × ENGINE_POLL_LIMIT` (10s) plus this
+///   tick, so about 12s;
 /// - one engine call that never answers: up to that call's own limit in
 ///   `supervisor::driver` — 60s for an add, 30s for a build, 10s for a pause,
 ///   resume or remove — so about 62s at worst;
@@ -227,23 +228,34 @@ async fn poll_session(session: &mut Session) -> Vec<Action> {
         return Vec::new();
     }
 
-    let completions =
-        match tokio::time::timeout(ENGINE_POLL_LIMIT, session.driver.poll_completions()).await {
-            Ok(notices) => notices,
-            Err(_) => return stalled(session),
-        };
+    // A read, bounded: if the engine will not say what finished, this tick
+    // simply has no news. Acting on what it did say is a separate step below,
+    // because a completion must not be consumed by a bound that fires halfway
+    // through carrying it out.
+    let finished = match tokio::time::timeout(ENGINE_POLL_LIMIT, session.driver.finished()).await {
+        Ok(finished) => finished,
+        Err(_) => return stalled(session),
+    };
+    let mut completions = Vec::new();
+    for infohash in finished {
+        // Through the same door as every other input, so a removal that does
+        // not answer hits the driver's own `CONTROL` bound, comes back as
+        // `FailedOp::Remove`, and kills the session. Never seed is not a
+        // promise to keep on a best-effort basis.
+        completions.extend(handle_bounded(session, Input::Completed(infohash)).await);
+    }
     let snapshots = match tokio::time::timeout(ENGINE_POLL_LIMIT, session.driver.snapshots()).await
     {
         Ok(snapshots) => snapshots,
         Err(_) => {
-            let mut actions = notices(completions);
+            let mut actions = completions;
             actions.extend(stalled(session));
             return actions;
         }
     };
 
     session.snapshot_stalled = false;
-    let mut actions = notices(completions);
+    let mut actions = completions;
     actions.push(Action::SnapshotsUpdated(snapshots));
     actions
 }
@@ -698,6 +710,7 @@ async fn event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::TorrentEngine;
     use crate::tui::action::KeyAction;
     use crate::tui::app::{Region, Section};
     use crate::vpn::guard::GuardState;
@@ -1316,6 +1329,119 @@ mod tests {
         );
     }
 
+    /// An engine holding one finished torrent whose `remove` never answers.
+    /// Nothing else in the suite hangs a remove, which is exactly why a
+    /// finished torrent could go on seeding unnoticed. Opens nothing.
+    struct StuckRemoveEngine;
+
+    #[async_trait::async_trait]
+    impl crate::engine::TorrentEngine for StuckRemoveEngine {
+        async fn add_magnet(
+            &self,
+            _magnet: &str,
+            _output_dir: &std::path::Path,
+            _paused: bool,
+        ) -> Result<crate::engine::InfoHash, crate::engine::EngineError> {
+            Ok("stuck".to_string())
+        }
+        async fn pause(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn resume(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn remove(
+            &self,
+            _infohash: &str,
+            _delete_files: bool,
+        ) -> Result<(), crate::engine::EngineError> {
+            std::future::pending().await
+        }
+        async fn snapshot(
+            &self,
+            _infohash: &str,
+        ) -> Result<crate::engine::TorrentSnapshot, crate::engine::EngineError> {
+            Err(crate::engine::EngineError::NotFound("none".into()))
+        }
+        async fn snapshots(&self) -> Vec<crate::engine::TorrentSnapshot> {
+            vec![crate::engine::TorrentSnapshot {
+                infohash: "5".repeat(40),
+                name: "finished".into(),
+                state: crate::engine::TorrentState::Seeding,
+                progress_bytes: 1024,
+                total_bytes: 1024,
+                download_speed: 0,
+                upload_speed: 4096,
+                error: None,
+            }]
+        }
+    }
+
+    struct StuckRemoveFactory;
+
+    #[async_trait::async_trait]
+    impl SessionFactory for StuckRemoveFactory {
+        async fn build(
+            &self,
+            _device: Option<&str>,
+        ) -> Result<Arc<dyn crate::engine::TorrentEngine>, crate::engine::EngineError> {
+            Ok(Arc::new(StuckRemoveEngine))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_that_never_answers_stops_the_session_rather_than_seeding_on() {
+        // Never seed is the promise this whole milestone exists to keep, and a
+        // completion is the one input that used to be able to break it
+        // quietly: the supervisor forgets a finished torrent the moment it is
+        // told, so a removal that does not land leaves the engine seeding with
+        // nobody left believing it is there. A completion must go through the
+        // same fail-closed path as every other input — a remove that does not
+        // answer kills the session, because failing to stop traffic is exactly
+        // when a kill switch is the only answer we trust.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let mut session = Session {
+            driver: Driver::new(
+                Arc::new(StuckRemoveFactory) as Arc<dyn SessionFactory>,
+                Supervisor::new(BindSupport::Supported),
+            ),
+            guard: Guard::new(),
+            adapter: Box::new(crate::vpn::adapter::GenericAdapter::new(
+                Arc::clone(&interfaces) as Arc<dyn crate::vpn::interfaces::InterfaceProvider>,
+            )),
+            snapshot_stalled: false,
+        };
+        let hash = "5".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        // The engine reports the torrent finished from the first look, so the
+        // start's own poll is already the tick that meets the stuck removal.
+        let mut actions = tokio::time::timeout(
+            Duration::from_secs(3600),
+            perform_session(Effect::StartDownload(hash), &app, &mut session),
+        )
+        .await
+        .expect("a removal that never answers must not hold the loop");
+        actions.extend(
+            tokio::time::timeout(Duration::from_secs(3600), poll_session(&mut session))
+                .await
+                .expect("nor on a later tick"),
+        );
+
+        assert!(
+            !session.driver.session_is_live(),
+            "a torrent we cannot take out of the session must stop the session: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Notice(_))),
+            "a session stopped under the user must be explained: {actions:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_finished_torrent_can_be_started_again() {
         // Completion drops the torrent from what the supervisor wants. If the
@@ -1401,6 +1527,10 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(a, Action::Notice(_))),
             "a download that finished must say so, or it looks like it stalled: {actions:?}"
+        );
+        assert!(
+            factory.engine().snapshots().await.is_empty(),
+            "the point is that it left the session, not that a notice fired"
         );
     }
 
