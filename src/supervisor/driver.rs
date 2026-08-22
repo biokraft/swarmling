@@ -54,6 +54,19 @@ impl Driver {
         self.execute(ops).await
     }
 
+    /// Tear the session down because an engine call did not answer.
+    ///
+    /// Dropping the handle is what actually stops it. `Input::SessionFailed`
+    /// on its own would not: it sets the supervisor to `Down` and produces a
+    /// notice, but leaves this engine field `Some`, so the session would keep
+    /// running while the supervisor believed it dead — worse than either state
+    /// on its own. So the drop comes first, and the supervisor is told after,
+    /// when its view already matches reality.
+    pub async fn force_kill(&mut self, reason: &str) -> Vec<String> {
+        self.engine = None;
+        self.handle(Input::SessionFailed(reason.to_string())).await
+    }
+
     /// Ask the engine what finished, and tell the supervisor. This is what
     /// enforces "never seed": a torrent that reaches `Seeding` is on its way
     /// out of the session.
@@ -196,6 +209,31 @@ mod tests {
 
     fn driver(factory: Arc<FakeFactory>) -> Driver {
         Driver::new(factory, Supervisor::new(BindSupport::Supported))
+    }
+
+    #[tokio::test]
+    async fn a_forced_kill_drops_the_engine_before_telling_the_supervisor() {
+        // `SessionFailed` alone would leave the handle alive: the supervisor
+        // would believe the session dead while it kept transferring, which is
+        // worse than either state on its own.
+        let f = Arc::new(FakeFactory::new());
+        let mut d = driver(Arc::clone(&f));
+        d.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }))
+        .await;
+        d.handle(Input::User(Intent::Add(wanted(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ))))
+        .await;
+        assert!(d.session_is_live());
+
+        let notices = d.force_kill("the backend stopped answering").await;
+        assert!(!d.session_is_live(), "the handle must be dropped");
+        assert!(
+            notices.iter().any(|n| n.contains("stopped answering")),
+            "the reason must reach the user: {notices:?}"
+        );
     }
 
     #[tokio::test]
