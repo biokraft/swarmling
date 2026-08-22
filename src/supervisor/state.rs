@@ -130,12 +130,20 @@ impl Supervisor {
             Input::User(intent) => self.apply_intent(intent, &mut ops),
             Input::Completed(infohash) => {
                 self.stalled = false;
+                let known = self.wanted.iter().any(|w| w.infohash == infohash);
                 // Never seed: a finished torrent leaves the session at once.
                 if self.in_session.remove(&infohash) {
                     ops.push(SessionOp::RemoveTorrent {
                         infohash: infohash.clone(),
                         delete_files: false,
                     });
+                }
+                if known {
+                    // Say so, or a download that finished and vanished from
+                    // the session is indistinguishable from one that stalled.
+                    ops.push(SessionOp::Notice(format!(
+                        "{infohash} finished and left the session — swarmling never seeds."
+                    )));
                 }
                 self.wanted.retain(|w| w.infohash != infohash);
             }
@@ -626,6 +634,20 @@ mod tests {
         );
         assert_eq!(s.wanted().len(), 1);
         assert_eq!(s.wanted()[0].infohash, "bb");
+    }
+
+    #[test]
+    fn a_finished_torrent_tells_the_user_it_finished() {
+        // A download that completes leaves the session at once, which looks
+        // exactly like one that stalled unless we say what happened.
+        let mut s = protected();
+        s.handle(Input::User(Intent::Add(wanted("aa"))));
+        let ops = s.handle(Input::Completed("aa".into()));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, SessionOp::Notice(message) if message.contains("finished"))),
+            "a completed download must say so: {ops:?}"
+        );
     }
 
     #[test]

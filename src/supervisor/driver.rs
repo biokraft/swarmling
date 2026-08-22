@@ -29,6 +29,17 @@ impl Driver {
         self.engine.is_some()
     }
 
+    /// Whether the supervisor already has this torrent among the ones it is
+    /// asked to carry. The caller needs it to decide between an `Add` and a
+    /// bare `Start`; keeping its own list beside this one would go stale the
+    /// moment a torrent finished and left `wanted` on its own.
+    pub fn knows(&self, infohash: &str) -> bool {
+        self.supervisor
+            .wanted()
+            .iter()
+            .any(|w| w.infohash == infohash)
+    }
+
     pub async fn snapshots(&self) -> Vec<TorrentSnapshot> {
         match &self.engine {
             Some(engine) => engine.snapshots().await,
