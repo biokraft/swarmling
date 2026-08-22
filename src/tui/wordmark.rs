@@ -64,7 +64,7 @@ mod tests {
 
     #[test]
     fn the_wordmark_spells_the_product_name() {
-        assert!(!LINES.is_empty());
+        assert_eq!(LINES.len(), 3);
         assert_eq!(width(), 36);
     }
 

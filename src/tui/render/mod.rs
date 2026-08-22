@@ -397,12 +397,12 @@ mod tests {
             results: (0..count)
                 .map(|i| crate::sources::SearchResult {
                     title: format!("row {i}"),
-                    magnet: format!("magnet:?xt=urn:btih:{:040x}", i),
+                    magnet: format!("magnet:?xt=urn:btih:{i:040x}"),
                     size_bytes: 1,
                     seeders: 100 - i,
                     leechers: 0,
                     source_id: "yts",
-                    infohash: format!("{:040x}", i),
+                    infohash: format!("{i:040x}"),
                 })
                 .collect(),
         });
