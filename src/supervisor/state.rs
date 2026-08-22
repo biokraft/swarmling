@@ -202,8 +202,7 @@ impl Supervisor {
                 w.paused = false;
                 if matches!(self.protection, Protection::Unprotected) {
                     ops.push(SessionOp::Notice(
-                        "no confirmed VPN tunnel, so nothing was started. \
-                         Connect your VPN and try again."
+                        "queued to start. Nothing will be downloaded until a VPN tunnel is up."
                             .to_string(),
                     ));
                     return;
@@ -615,13 +614,46 @@ mod tests {
 
     #[test]
     fn a_fresh_user_intent_clears_a_stall() {
+        // aa must be paused before the failure, so the only way reconcile can
+        // see something active to rebuild for is if Start's `w.paused = false`
+        // actually ran.
         let mut s = protected();
         s.handle(Input::User(Intent::Add(wanted("aa"))));
+        s.handle(Input::User(Intent::Pause("aa".into())));
         s.handle(Input::SessionFailed("backend exploded".into()));
         let ops = s.handle(Input::User(Intent::Start("aa".into())));
         assert!(
             ops.iter().any(|op| matches!(op, SessionOp::Build { .. })),
             "an explicit user retry must be allowed to rebuild: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn refusing_to_start_still_latches_and_starts_once_bound() {
+        // Start's unpause happens before the unprotected guard, matching Add.
+        // The refusal notice must not be the last word: a later bind with no
+        // further user action brings the torrent up unpaused.
+        let mut s = Supervisor::new(BindSupport::Supported);
+        let mut paused = wanted("aa");
+        paused.paused = true;
+        s.handle(Input::User(Intent::Add(paused)));
+        s.handle(Input::User(Intent::Start("aa".into())));
+        let ops = s.handle(Input::Vpn(GuardAction::Bind {
+            device: "utun4".into(),
+        }));
+        assert_eq!(
+            ops,
+            vec![
+                SessionOp::Build {
+                    device: Some("utun4".to_string())
+                },
+                SessionOp::AddTorrent {
+                    infohash: "aa".to_string(),
+                    magnet: "magnet:?xt=urn:btih:aa".to_string(),
+                    dir: std::path::PathBuf::from("/downloads"),
+                    paused: false,
+                },
+            ]
         );
     }
 
