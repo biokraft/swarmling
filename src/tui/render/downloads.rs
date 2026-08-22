@@ -37,7 +37,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let width = inner.width as usize;
-    let mut lines: Vec<Line> = vec![guard_line(app.guard_state(), std::env::consts::OS)];
+    let mut lines: Vec<Line> = guard_lines(app.guard_state(), std::env::consts::OS);
 
     if app.queue.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -74,7 +74,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         let snapshot = app
             .snapshots()
             .iter()
-            .find(|s| s.infohash == entry.infohash);
+            .find(|s| s.infohash.eq_ignore_ascii_case(&entry.infohash));
         let mut detail = vec![
             Span::raw("  "),
             Span::styled(format!("{tag} "), Style::default().fg(tag_colour)),
@@ -153,10 +153,13 @@ fn progress_span(snapshot: Option<&TorrentSnapshot>) -> Span<'static> {
     }
 }
 
-/// The persistent line describing the tunnel: whether it is up, and — on a
-/// platform that cannot bind traffic to an interface — that traffic is not
-/// pinned to the device even while protected.
-fn guard_line(guard: &GuardState, os: &str) -> Line<'static> {
+/// The persistent lines describing the tunnel: whether it is up, and — on a
+/// platform that cannot bind traffic to an interface — a second, own line
+/// saying that traffic is not pinned to the device even while protected. Kept
+/// on its own line rather than appended to the status line so a narrow panel
+/// truncates the (already-visible) status first, never silently drops the
+/// warning while leaving the reassuring text on screen.
+pub(crate) fn guard_lines(guard: &GuardState, os: &str) -> Vec<Line<'static>> {
     let (text, colour) = match guard {
         GuardState::Unprotected => ("VPN: not connected — nothing is protected".to_owned(), BAD),
         GuardState::Protected { device } => (format!("VPN: connected via {device}"), GOOD),
@@ -165,15 +168,51 @@ fn guard_line(guard: &GuardState, os: &str) -> Line<'static> {
             BAD,
         ),
     };
-    let mut spans = vec![Span::styled(text, Style::default().fg(colour))];
+    let mut lines = vec![Line::from(Span::styled(text, Style::default().fg(colour)))];
     if matches!(
         crate::vpn::policy::bind_support_for(os),
         BindSupport::Unsupported
     ) {
-        spans.push(Span::styled(
-            " — traffic is not pinned to the tunnel device on this platform".to_owned(),
+        lines.push(Line::from(Span::styled(
+            "traffic is not pinned to the tunnel device on this platform".to_owned(),
             Style::default().fg(WARN),
-        ));
+        )));
     }
-    Line::from(spans)
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_unsupported_platform_note_appears_on_windows_and_not_on_linux() {
+        let guard = GuardState::Protected {
+            device: "wg0".into(),
+        };
+        let windows = guard_lines(&guard, "windows");
+        let linux = guard_lines(&guard, "linux");
+        let text_of = |lines: &[Line]| -> String {
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            text_of(&windows).contains("not pinned to the tunnel device"),
+            "windows must carry the note: {}",
+            text_of(&windows)
+        );
+        assert!(
+            !text_of(&linux).contains("not pinned to the tunnel device"),
+            "linux must not carry a false weakness note: {}",
+            text_of(&linux)
+        );
+    }
 }
