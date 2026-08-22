@@ -4,10 +4,13 @@
 //! owns the terminal lifecycle, the `select!` loop, and the execution of the
 //! [`Effect`]s the app asks for.
 //!
-//! **It constructs no torrent engine and no `librqbit::Session`.** In this
-//! milestone a download is a recorded intent: queue effects read and rewrite
-//! the queue *file*, exactly as `swarmling add` does. Nothing here contacts a
-//! tracker, a DHT node, or a peer.
+//! **This is the only file in swarmling that builds a real session.** It
+//! constructs the one [`LibrqbitFactory`] in the codebase and hands it to a
+//! [`Driver`]; everything else — including every test, here and elsewhere —
+//! goes through the `SessionFactory` seam and a fake. A session comes up only
+//! after the guard has confirmed a tunnel *and* the user has pressed start:
+//! restoring the queue file at startup fills the Downloads panel and sends no
+//! intent, so opening swarmling to look at the queue never moves a byte.
 //!
 //! Failures never tear the UI down. A clipboard with no owner, a directory
 //! that cannot be created, a queue file that cannot be written — each becomes
@@ -16,6 +19,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream};
@@ -29,14 +33,27 @@ use crate::download::persist::{load_entries, save_entries};
 use crate::download::queue::QueueEntry;
 use crate::search::{search_all, SearchEvent};
 use crate::sources::registry::all_sources;
+use crate::supervisor::driver::Driver;
+use crate::supervisor::factory::{LibrqbitFactory, SessionFactory};
+use crate::supervisor::{Input, Intent, Supervisor, Wanted};
 use crate::tui::action::{Action, Effect};
 use crate::tui::app::App;
 use crate::tui::event::{map_key, Context};
 use crate::tui::render;
+use crate::vpn::adapter::VpnAdapter;
+use crate::vpn::guard::{Guard, GuardAction};
 
 /// How often the app is told what time it is. Notices expire from this tick,
 /// and it is the only clock the app ever sees.
 const TICK: Duration = Duration::from_millis(250);
+
+/// How often the VPN is looked at. The guard is the kill switch, so this is
+/// the longest a lost tunnel can go unnoticed on a platform that cannot bind.
+const VPN_POLL: Duration = Duration::from_secs(2);
+
+/// How often a live session is asked what it is doing. Only runs while a
+/// session exists, so an idle app polls nothing.
+const SESSION_POLL: Duration = Duration::from_secs(1);
 
 /// Leave raw mode and the alternate screen, ignoring errors. Called on the
 /// normal exit path and from the panic hook, so it must be safe to call
@@ -80,6 +97,126 @@ struct Runtime {
     health: HashMap<&'static str, bool>,
     search: Option<mpsc::Receiver<SearchEvent>>,
     quit: bool,
+}
+
+/// The live half of the loop: the VPN it watches, the guard that decides what
+/// that means, and the driver that owns whatever session exists. Kept apart
+/// from [`Runtime`] because none of it may be reachable from a pure effect.
+struct Session {
+    driver: Driver,
+    guard: Guard,
+    adapter: Box<dyn VpnAdapter>,
+    /// The torrents the supervisor has already been told about. A start for
+    /// one it has never heard of needs an `Add` first; a second start must
+    /// not add it twice.
+    known: std::collections::HashSet<String>,
+}
+
+/// Every notice the driver produces has to reach the user: a dropped one is a
+/// transfer that silently did not happen.
+fn notices(messages: Vec<String>) -> Vec<Action> {
+    messages.into_iter().map(Action::Notice).collect()
+}
+
+/// Look at the VPN once and let the guard decide what it means. `status` is
+/// infallible — an adapter that cannot tell reports `VpnStatus::Unknown`,
+/// which the guard treats exactly like a disconnection.
+async fn poll_vpn(session: &mut Session) -> Vec<Action> {
+    let status = session.adapter.status().await;
+    let action = session.guard.observe(&status);
+    // The kill switch firing has to be visible. `SessionOp::Kill` carries its
+    // reason to the driver, which drops the session without a word, so the
+    // announcement is made here — a queue that stops dead with no explanation
+    // reads as a hang.
+    let mut actions = match &action {
+        GuardAction::PauseAll { reason } => {
+            vec![Action::Notice(format!("Stopped every transfer: {reason}"))]
+        }
+        _ => Vec::new(),
+    };
+    actions.extend(notices(session.driver.handle(Input::Vpn(action)).await));
+    actions.push(Action::GuardChanged(session.guard.state().clone()));
+    actions
+}
+
+/// Ask a live session what it is doing. Silent while none exists, so a fresh
+/// app never reports progress it does not have.
+async fn poll_session(session: &mut Session) -> Vec<Action> {
+    if !session.driver.session_is_live() {
+        return Vec::new();
+    }
+    let mut actions = notices(session.driver.poll_completions().await);
+    actions.push(Action::SnapshotsUpdated(session.driver.snapshots().await));
+    actions
+}
+
+/// The three effects that touch a real session. Separate from [`perform`]
+/// because they await, and because keeping them here makes it obvious which
+/// effects can move bytes.
+async fn perform_session(effect: Effect, app: &App, session: &mut Session) -> Vec<Action> {
+    let mut actions = Vec::new();
+    match effect {
+        Effect::StartDownload(infohash) => {
+            if !session.known.contains(&infohash) {
+                let Some(entry) = app.queue.iter().find(|e| e.infohash == infohash) else {
+                    // The row went away between the key press and here.
+                    return vec![Action::Notice("That download is no longer queued".into())];
+                };
+                let wanted = Wanted {
+                    infohash: infohash.clone(),
+                    magnet: entry.magnet.clone(),
+                    dir: entry
+                        .dir
+                        .clone()
+                        .unwrap_or_else(|| app.download_dir.clone()),
+                    // Added paused: an add is a record, and only the start
+                    // below may set it running.
+                    paused: true,
+                };
+                actions.extend(notices(
+                    session
+                        .driver
+                        .handle(Input::User(Intent::Add(wanted)))
+                        .await,
+                ));
+                session.known.insert(infohash.clone());
+            }
+            actions.extend(notices(
+                session
+                    .driver
+                    .handle(Input::User(Intent::Start(infohash)))
+                    .await,
+            ));
+        }
+        Effect::PauseDownload(infohash) => {
+            actions.extend(notices(
+                session
+                    .driver
+                    .handle(Input::User(Intent::Pause(infohash)))
+                    .await,
+            ));
+        }
+        Effect::RemoveDownload {
+            infohash,
+            delete_files,
+        } => {
+            session.known.remove(&infohash);
+            actions.extend(notices(
+                session
+                    .driver
+                    .handle(Input::User(Intent::Remove {
+                        infohash,
+                        delete_files,
+                    }))
+                    .await,
+            ));
+        }
+        // Every other effect is `perform`'s; the caller routes by variant,
+        // so reaching this arm means nothing was asked of the session.
+        _ => return Vec::new(),
+    }
+    actions.extend(poll_session(session).await);
+    actions
 }
 
 /// One thing that woke the loop up.
@@ -231,20 +368,11 @@ fn perform(effect: Effect, app: &App, rt: &mut Runtime) -> Vec<Action> {
             vec![Action::DownloadDirChanged(dir)]
         }
 
-        // Wiring these into a live session is a later milestone's job; this
-        // task only introduces the vocabulary the event loop will eventually
-        // act on. No socket, no session, nothing started here.
-        //
-        // TRIPWIRE: the wiring task MUST delete this arm (replacing it with
-        // real session calls) and delete the covering test
-        // `the_session_effects_are_still_stubbed_out` in this module's test
-        // suite. Leaving either behind would mean `s`/`p` silently do
-        // nothing forever, which is exactly the defect this stub exists to
-        // avoid — see the notice below.
+        // Handled by `perform_session`, which awaits a real driver. The
+        // caller routes them there; reaching this arm would mean the routing
+        // was lost, so it does nothing rather than pretending to.
         Effect::StartDownload(_) | Effect::PauseDownload(_) | Effect::RemoveDownload { .. } => {
-            vec![Action::Notice(
-                "Live transfers are not available yet".to_string(),
-            )]
+            Vec::new()
         }
     }
 }
@@ -302,7 +430,7 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 /// Feed one action to the app and perform whatever it asks for, until the
 /// work settles. Effects feed actions back, so this drains a queue rather
 /// than recursing; `LIMIT` stops a pathological cycle from hanging the UI.
-async fn dispatch(action: Action, app: &mut App, rt: &mut Runtime) {
+async fn dispatch(action: Action, app: &mut App, rt: &mut Runtime, session: &mut Session) {
     const LIMIT: usize = 64;
     let mut pending = VecDeque::from([action]);
     let mut steps = 0;
@@ -312,20 +440,27 @@ async fn dispatch(action: Action, app: &mut App, rt: &mut Runtime) {
             break;
         }
         for effect in app.update(action) {
-            if let Effect::StartSearch(query) = effect {
-                app.results.clear();
-                rt.search = Some(search_all(all_sources(), &query).await);
-                continue;
+            match effect {
+                Effect::StartSearch(query) => {
+                    app.results.clear();
+                    rt.search = Some(search_all(all_sources(), &query).await);
+                }
+                Effect::StartDownload(_)
+                | Effect::PauseDownload(_)
+                | Effect::RemoveDownload { .. } => {
+                    pending.extend(perform_session(effect, app, session).await);
+                }
+                effect => pending.extend(perform(effect, app, rt)),
             }
-            pending.extend(perform(effect, app, rt));
         }
     }
 }
 
 /// Run the terminal UI until the user quits.
 ///
-/// Constructs no engine and no session: the queue effects touch the queue
-/// file and nothing else.
+/// Builds the driver that can bring a session up, but brings none up here:
+/// the queue is restored for display only, and the first session can appear
+/// no earlier than the first start the user presses under a confirmed VPN.
 pub async fn run() -> anyhow::Result<()> {
     let queue_path = paths::queue_state_path();
     let settings_path = paths::settings_path();
@@ -335,8 +470,24 @@ pub async fn run() -> anyhow::Result<()> {
     // simply yields the default folder, and `SaveDownloadDir` refuses to
     // overwrite it.
     let cfg = settings::load_result(&settings_path).settings();
-    let download_dir = cfg.download_dir.unwrap_or_else(paths::default_download_dir);
-    let mut app = App::new(download_dir, entries);
+    let download_dir = cfg
+        .download_dir
+        .clone()
+        .unwrap_or_else(paths::default_download_dir);
+    // Restored for display only. No `Intent` is sent here, and `known` starts
+    // empty, so nothing in this queue is running until the user says so.
+    let mut app = App::new(download_dir.clone(), entries);
+
+    let factory: Arc<dyn SessionFactory> = Arc::new(LibrqbitFactory::new(
+        download_dir,
+        paths::data_dir().join("session"),
+    ));
+    let mut session = Session {
+        driver: Driver::new(factory, Supervisor::new(crate::vpn::policy::bind_support())),
+        guard: Guard::new(),
+        adapter: crate::vpn::require::adapter_for(&cfg),
+        known: std::collections::HashSet::new(),
+    };
 
     let mut rt = Runtime {
         queue_path,
@@ -360,7 +511,7 @@ pub async fn run() -> anyhow::Result<()> {
     }));
 
     let mut terminal = enter_terminal()?;
-    let result = event_loop(&mut terminal, &mut app, &mut rt).await;
+    let result = event_loop(&mut terminal, &mut app, &mut rt, &mut session).await;
     restore_terminal_best_effort();
     let _ = terminal.show_cursor();
     result
@@ -377,13 +528,18 @@ async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     rt: &mut Runtime,
+    session: &mut Session,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut vpn_ticker = tokio::time::interval(VPN_POLL);
+    vpn_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut session_ticker = tokio::time::interval(SESSION_POLL);
+    session_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     if let Ok(size) = terminal.size() {
-        dispatch(Action::Resize(size.width, size.height), app, rt).await;
+        dispatch(Action::Resize(size.width, size.height), app, rt, session).await;
     }
     terminal.draw(|frame| render::draw(frame, app))?;
 
@@ -397,6 +553,11 @@ async fn event_loop(
             },
             event = next_search(&mut rt.search) => Step::Search(event),
             _ = ticker.tick() => Step::Actions(vec![Action::Tick(Instant::now())]),
+            // The kill switch: this is the only thing that notices a tunnel
+            // going away, so it runs whether or not a session exists.
+            _ = vpn_ticker.tick() => Step::Actions(poll_vpn(session).await),
+            // Progress and completions, only while something is running.
+            _ = session_ticker.tick() => Step::Actions(poll_session(session).await),
         };
 
         let actions = match step {
@@ -410,7 +571,7 @@ async fn event_loop(
         };
 
         for action in actions {
-            dispatch(action, app, rt).await;
+            dispatch(action, app, rt, session).await;
         }
         if rt.quit || app.should_quit {
             break;
@@ -423,6 +584,8 @@ async fn event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vpn::guard::GuardState;
+    use crate::vpn::policy::BindSupport;
 
     #[test]
     fn the_panic_hook_restores_the_terminal_before_reporting() {
@@ -438,44 +601,208 @@ mod tests {
         restore_terminal_best_effort();
     }
 
-    #[test]
-    fn the_session_effects_are_still_stubbed_out() {
-        // TRIPWIRE: this test exists to fail loudly the day someone wires
-        // Effect::{StartDownload,PauseDownload,RemoveDownload} into a real
-        // session and forgets to delete the stub arm in `perform`. Until
-        // then, pressing the keys that produce these effects must tell the
-        // user why nothing happened rather than silently doing nothing — the
-        // defect a prior milestone shipped five times over.
-        //
-        // When the wiring task lands, DELETE this test along with the stub
-        // arm in `perform` that it covers.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut rt = Runtime {
-            queue_path: dir.path().join("queue.json"),
-            settings_path: dir.path().join("settings.json"),
-            health: HashMap::new(),
-            search: None,
-            quit: false,
-        };
-        let app = App::new(dir.path().to_path_buf(), Vec::new());
+    fn queued(hash: &str, dir: Option<PathBuf>) -> QueueEntry {
+        QueueEntry {
+            infohash: hash.to_string(),
+            magnet: format!("magnet:?xt=urn:btih:{hash}"),
+            title: "Example".into(),
+            added_unix: 0,
+            paused: false,
+            source_id: None,
+            dir,
+        }
+    }
 
-        for effect in [
-            Effect::StartDownload("a".repeat(40)),
-            Effect::PauseDownload("a".repeat(40)),
+    /// A session wired to a fake factory and a fake interface list. Opens
+    /// nothing: no test in this file may name the real factory or engine.
+    fn fake_session(
+        interfaces: Arc<crate::vpn::interfaces::FakeInterfaces>,
+    ) -> (Arc<crate::supervisor::factory::FakeFactory>, Session) {
+        let factory = Arc::new(crate::supervisor::factory::FakeFactory::new());
+        let session = Session {
+            driver: Driver::new(
+                Arc::clone(&factory) as Arc<dyn SessionFactory>,
+                Supervisor::new(BindSupport::Supported),
+            ),
+            guard: Guard::new(),
+            adapter: Box::new(crate::vpn::adapter::GenericAdapter::new(interfaces)),
+            known: std::collections::HashSet::new(),
+        };
+        (factory, session)
+    }
+
+    fn tunnel(name: &str) -> crate::vpn::interfaces::Interface {
+        crate::vpn::interfaces::Interface {
+            name: name.into(),
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_effect_becomes_a_supervisor_intent() {
+        // The effect must reach the engine, not merely be accepted and
+        // dropped. A silently ignored effect is the defect this catches, and
+        // the stub arm it replaces did exactly that on purpose.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (factory, mut session) = fake_session(interfaces);
+        let hash = "a".repeat(40);
+        let app = App::new(
+            dir.path().to_path_buf(),
+            vec![queued(&hash, Some(dir.path().join("here")))],
+        );
+
+        // The tunnel has to be confirmed before anything may start.
+        poll_vpn(&mut session).await;
+        let actions =
+            perform_session(Effect::StartDownload(hash.clone()), &app, &mut session).await;
+
+        assert!(
+            session.driver.session_is_live(),
+            "a start with a live tunnel must bring the session up: {actions:?}"
+        );
+        assert_eq!(
+            factory.engine().added_magnets().len(),
+            1,
+            "the start effect never reached the engine: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_starts_while_the_tunnel_is_unconfirmed() {
+        // Fail closed: with no VPN observed, a start must refuse and say so
+        // rather than open a session.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "en0",
+        )]));
+        let (factory, mut session) = fake_session(interfaces);
+        let hash = "b".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        let actions = perform_session(Effect::StartDownload(hash), &app, &mut session).await;
+
+        assert!(!session.driver.session_is_live(), "{actions:?}");
+        assert!(factory.engine().added_magnets().is_empty(), "{actions:?}");
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Notice(_))),
+            "a refusal the user cannot see is a silent failure: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_uses_the_folder_recorded_on_the_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (_factory, mut session) = fake_session(interfaces);
+        let hash = "c".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        perform_session(Effect::StartDownload(hash.clone()), &app, &mut session).await;
+        // The default folder stands in when the entry names none; the entry
+        // must not be dropped for want of a directory.
+        assert!(session.known.contains(&hash));
+    }
+
+    #[tokio::test]
+    async fn removing_an_entry_takes_it_out_of_the_session_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (_factory, mut session) = fake_session(interfaces);
+        let hash = "d".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        perform_session(Effect::StartDownload(hash.clone()), &app, &mut session).await;
+        assert!(session.known.contains(&hash));
+
+        perform_session(
             Effect::RemoveDownload {
-                infohash: "a".repeat(40),
+                infohash: hash.clone(),
                 delete_files: false,
             },
-        ] {
-            let actions = perform(effect, &app, &mut rt);
-            assert!(
-                matches!(
-                    actions.as_slice(),
-                    [Action::Notice(n)] if n == "Live transfers are not available yet"
-                ),
-                "a stubbed session effect must say so, not do nothing: {actions:?}"
-            );
-        }
+            &app,
+            &mut session,
+        )
+        .await;
+        assert!(
+            !session.known.contains(&hash),
+            "a removed torrent must stop being one the loop believes is running"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_tunnel_pauses_everything_and_tells_the_user() {
+        // The kill switch has to be visible: a pause the user is not told
+        // about looks like a stall.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (_factory, mut session) = fake_session(Arc::clone(&interfaces));
+        let hash = "e".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        perform_session(Effect::StartDownload(hash), &app, &mut session).await;
+        assert!(session.driver.session_is_live());
+
+        interfaces.set(vec![tunnel("en0")]);
+        let actions = poll_vpn(&mut session).await;
+
+        assert!(
+            !session.driver.session_is_live(),
+            "the session must go down when the tunnel does: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Notice(_))),
+            "the kill switch firing must reach the user: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::GuardChanged(GuardState::Lost { .. }))),
+            "the guard's new state must reach the app: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_poll_is_silent_until_a_session_exists() {
+        // Starting the app must never look like a running transfer.
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![]));
+        let (_factory, mut session) = fake_session(interfaces);
+        assert!(poll_session(&mut session).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_finished_torrent_leaves_the_session_and_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (factory, mut session) = fake_session(interfaces);
+        let hash = "f".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        perform_session(Effect::StartDownload(hash.clone()), &app, &mut session).await;
+        factory.engine().finish(&hash);
+
+        let actions = poll_session(&mut session).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SnapshotsUpdated(_))),
+            "the poll must feed progress back to the app: {actions:?}"
+        );
     }
 
     #[test]
