@@ -53,11 +53,20 @@ const TICK: Duration = Duration::from_millis(250);
 ///
 /// The worst case is longer, and saying otherwise would understate a safety
 /// latency. Every branch of the loop runs in one task, so a wedged backend
-/// delays this tick by whatever the branch ahead of it is waiting on: up to
-/// `2 × ENGINE_POLL_LIMIT` for a stalled snapshot poll, or up to
-/// `ENGINE_CALL_LIMIT` for an engine call that never answers. Worst case is
-/// therefore about 12 seconds behind a wedged poll and about 32 behind a
-/// wedged call — after which the tunnel is noticed and everything stops.
+/// delays this tick by whatever the branch ahead of it is waiting on:
+///
+/// - a stalled snapshot poll: up to `2 × ENGINE_POLL_LIMIT`, so about 12s;
+/// - one engine call that never answers: up to that call's own limit in
+///   `supervisor::driver` — 60s for an add, 30s for a build, 10s for a pause,
+///   resume or remove — so about 62s at worst;
+/// - a batch of instructions whose calls each time out: up to
+///   `ENGINE_BATCH_LIMIT`, about 302s, which needs a pathological op list of
+///   several timed-out calls in a row and should never be seen in practice.
+///
+/// After that delay the tunnel is noticed and everything stops. On a platform
+/// that can bind, traffic is pinned to the tunnel device throughout and cannot
+/// leave by another route, so the exposure is real only where binding is
+/// unsupported.
 const VPN_POLL: Duration = Duration::from_secs(2);
 
 /// How often a live session is asked what it is doing. Only runs while a
@@ -68,15 +77,16 @@ const SESSION_POLL: Duration = Duration::from_secs(1);
 /// call, and well under the point where a person would call the UI frozen.
 const ENGINE_POLL_LIMIT: Duration = Duration::from_secs(5);
 
-/// How long the engine gets to carry out an instruction — a build, an add, a
-/// pause, a resume, a remove.
+/// A backstop on a whole batch of instructions, not the primary mechanism.
 ///
-/// Longer than the poll limit on purpose: resolving a magnet legitimately
-/// takes a while, and tripping this costs the user a session they must start
-/// again, so it must not fire on a slow-but-working add. Short enough that a
-/// backend which has genuinely stopped answering does not sit in the loop
-/// holding the VPN tick behind it for minutes.
-const ENGINE_CALL_LIMIT: Duration = Duration::from_secs(30);
+/// Each engine call is bounded individually inside the driver, where a miss
+/// can be attributed to the torrent that caused it. This is the last resort
+/// for a pathological op list — one long enough that its individually-bounded
+/// calls still add up to minutes — and it is deliberately sized so ordinary
+/// work never reaches it: a batch that trips this has already had every call
+/// inside it time out. Tripping it tears the session down, which is why it
+/// must not be the thing that fires during normal use.
+const ENGINE_BATCH_LIMIT: Duration = Duration::from_secs(300);
 
 /// Leave raw mode and the alternate screen, ignoring errors. Called on the
 /// normal exit path and from the panic hook, so it must be safe to call
@@ -148,13 +158,14 @@ fn notices(messages: Vec<String>) -> Vec<Action> {
 /// dropping during the hang would never reach the guard while a live session
 /// kept transferring.
 ///
-/// A call that does not answer fails closed. We asked the engine to do
-/// something and it never said whether it did; we can no longer reason about
-/// what it is carrying, and an engine we cannot reason about is exactly what a
-/// kill switch is for. This is the one place a timeout escalates rather than
-/// backs off — unlike a stalled poll, which only costs us a fresh reading.
+/// The driver bounds every engine call it makes, and a call that misses its
+/// deadline comes back as an ordinary failure — so a slow magnet costs its own
+/// torrent its place and nothing else. This bound is the backstop underneath
+/// that one: it catches only a batch whose calls have each already timed out,
+/// and it escalates, because a batch that long means we can no longer say what
+/// the engine is carrying.
 async fn handle_bounded(session: &mut Session, input: Input) -> Vec<Action> {
-    match tokio::time::timeout(ENGINE_CALL_LIMIT, session.driver.handle(input)).await {
+    match tokio::time::timeout(ENGINE_BATCH_LIMIT, session.driver.handle(input)).await {
         Ok(messages) => notices(messages),
         Err(_) => notices(
             session
@@ -1130,13 +1141,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_engine_call_that_never_answers_tears_the_session_down() {
-        // Third door to the same failure: `driver.handle` awaits real engine
-        // work, and it sits in the same select loop as the VPN tick. An add
-        // that never returns would hold the loop, so a tunnel dropping during
-        // the hang would never reach the guard while the session carried on.
-        // An engine we can no longer reason about is exactly when a kill
-        // switch should fire, so this one fails closed.
+    async fn a_stuck_engine_call_never_holds_the_loop() {
+        // `driver.handle` awaits real engine work and sits in the same select
+        // loop as the VPN tick, so a call that never answers must not be able
+        // to hold it. Since the driver bounds each call individually, a single
+        // stuck add is now that torrent's failure alone: the session stays up,
+        // the row is named, and the kill switch keeps its turn.
         let dir = tempfile::tempdir().expect("tempdir");
         let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
             "utun4",
@@ -1157,31 +1167,82 @@ mod tests {
 
         poll_vpn(&mut session).await;
         let actions = tokio::time::timeout(
-            Duration::from_secs(600),
-            perform_session(Effect::StartDownload(hash), &app, &mut session),
+            Duration::from_secs(3600),
+            perform_session(Effect::StartDownload(hash.clone()), &app, &mut session),
         )
         .await
         .expect("an engine call that never answers must not hold the loop");
 
         assert!(
-            !session.driver.session_is_live(),
-            "an engine we cannot reason about must be torn down, not left running: {actions:?}"
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Notice(n) if n.contains(&hash))),
+            "the torrent that did not answer must be named, not merely counted: {actions:?}"
         );
         assert!(
-            actions.iter().any(|a| matches!(a, Action::Notice(_))),
-            "a session torn down under the user must be explained: {actions:?}"
+            session.driver.session_is_live(),
+            "one stuck add is that torrent's problem, not grounds to stop everything: {actions:?}"
         );
 
         // The loop is still the loop: the kill switch keeps its turn.
         interfaces.set(vec![tunnel("en0")]);
-        let after = tokio::time::timeout(Duration::from_secs(600), poll_vpn(&mut session))
+        let after = tokio::time::timeout(Duration::from_secs(3600), poll_vpn(&mut session))
             .await
             .expect("the VPN poll must still be reached after a stuck engine call");
         assert!(
-            after
-                .iter()
-                .any(|a| matches!(a, Action::GuardChanged(GuardState::Lost { .. }))),
-            "the guard must still be observing after a stuck engine call: {after:?}"
+            !session.driver.session_is_live(),
+            "a tunnel lost after a stuck call must still stop everything: {after:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_of_calls_that_all_hang_still_tears_the_session_down() {
+        // The backstop. Each call is bounded in the driver, so reaching this
+        // needs a whole batch of calls that every one of them timed out — at
+        // which point we can no longer say what the engine is carrying, and
+        // that is what a teardown is for.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![]));
+        let mut session = Session {
+            driver: Driver::new(
+                Arc::new(StuckAddFactory) as Arc<dyn SessionFactory>,
+                Supervisor::new(BindSupport::Supported),
+            ),
+            guard: Guard::new(),
+            adapter: Box::new(crate::vpn::adapter::GenericAdapter::new(
+                Arc::clone(&interfaces) as Arc<dyn crate::vpn::interfaces::InterfaceProvider>,
+            )),
+            snapshot_stalled: false,
+        };
+        let entries: Vec<QueueEntry> = (0..6).map(|i| queued(&format!("{i:040}"), None)).collect();
+        let app = App::new(dir.path().to_path_buf(), entries.clone());
+
+        // Wanted with no tunnel, so nothing is added yet.
+        poll_vpn(&mut session).await;
+        for entry in &entries {
+            perform_session(
+                Effect::StartDownload(entry.infohash.clone()),
+                &app,
+                &mut session,
+            )
+            .await;
+        }
+        assert!(!session.driver.session_is_live());
+
+        // The tunnel arriving reconciles into one batch: a build and six adds,
+        // every one of which hangs.
+        interfaces.set(vec![tunnel("utun4")]);
+        let actions = tokio::time::timeout(Duration::from_secs(3600), poll_vpn(&mut session))
+            .await
+            .expect("even a batch of hanging calls must not hold the loop");
+
+        assert!(
+            !session.driver.session_is_live(),
+            "a batch we cannot account for must be torn down: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Notice(_))),
+            "a session torn down under the user must be explained: {actions:?}"
         );
     }
 

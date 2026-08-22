@@ -10,6 +10,53 @@ use crate::engine::{TorrentEngine, TorrentSnapshot, TorrentState};
 use crate::supervisor::factory::SessionFactory;
 use crate::supervisor::state::{FailedOp, Input, SessionOp, Supervisor};
 
+/// How long one engine call gets before we stop waiting on it.
+///
+/// The bound is per call, not per batch. A tunnel coming back reconciles into
+/// a build plus one add per wanted row, and several slow-but-working adds
+/// sharing a single budget would mean the budget shrinks as the queue grows,
+/// and one slow magnet takes every other transfer down with it. Failing closed
+/// is for the cases where we cannot tell what the engine is doing, not for
+/// ordinary slowness.
+mod limits {
+    use std::time::Duration;
+
+    /// Magnet resolution walks the DHT and waits on peers; a thinly-seeded
+    /// torrent legitimately takes tens of seconds. Generous, because firing
+    /// early drops a download that was about to work, while firing late costs
+    /// only that one torrent's place in the session.
+    pub const ADD: Duration = Duration::from_secs(60);
+
+    /// Building a session is local work: binding a socket and opening the
+    /// session directory. A half-built session is not something to keep, so
+    /// this one still escalates.
+    pub const BUILD: Duration = Duration::from_secs(30);
+
+    /// Pausing, resuming and removing act on a torrent the session already
+    /// holds. Short, because these are the calls whose failure means we can no
+    /// longer be sure traffic has stopped.
+    pub const CONTROL: Duration = Duration::from_secs(10);
+}
+
+/// Await one engine call with a deadline, turning a miss into the same error
+/// the engine itself would have reported. That routes it into the `OpFailed`
+/// feedback the supervisor already understands: a slow add becomes that
+/// torrent's problem alone, while a pause or remove that does not answer still
+/// fails closed and kills the session, because failing to stop traffic is the
+/// one case where teardown is the only answer we trust.
+async fn bounded<T, F>(limit: std::time::Duration, call: F) -> Result<T, crate::engine::EngineError>
+where
+    F: std::future::Future<Output = Result<T, crate::engine::EngineError>>,
+{
+    match tokio::time::timeout(limit, call).await {
+        Ok(result) => result,
+        Err(_) => Err(crate::engine::EngineError::Backend(format!(
+            "no answer within {}s",
+            limit.as_secs()
+        ))),
+    }
+}
+
 pub struct Driver {
     factory: Arc<dyn SessionFactory>,
     supervisor: Supervisor,
@@ -98,17 +145,20 @@ impl Driver {
                     // can be sure works, so we never wait on a graceful stop.
                     self.engine = None;
                 }
-                SessionOp::Build { device } => match self.factory.build(device.as_deref()).await {
-                    Ok(engine) => self.engine = Some(engine),
-                    Err(e) => {
-                        self.engine = None;
-                        // Re-entering the supervisor here is safe: `SessionFailed`
-                        // produces only a notice and never another build.
-                        let more = Box::pin(self.handle(Input::SessionFailed(e.to_string()))).await;
-                        notices.extend(more);
-                        return notices;
+                SessionOp::Build { device } => {
+                    match bounded(limits::BUILD, self.factory.build(device.as_deref())).await {
+                        Ok(engine) => self.engine = Some(engine),
+                        Err(e) => {
+                            self.engine = None;
+                            // Re-entering the supervisor here is safe: `SessionFailed`
+                            // produces only a notice and never another build.
+                            let more =
+                                Box::pin(self.handle(Input::SessionFailed(e.to_string()))).await;
+                            notices.extend(more);
+                            return notices;
+                        }
                     }
-                },
+                }
                 SessionOp::AddTorrent {
                     infohash,
                     magnet,
@@ -118,8 +168,13 @@ impl Driver {
                     let Some(engine) = self.engine.clone() else {
                         continue;
                     };
-                    if let Err(e) = engine.add_magnet(&magnet, &dir, paused).await {
-                        notices.push(format!("Could not start that download ({e})"));
+                    if let Err(e) =
+                        bounded(limits::ADD, engine.add_magnet(&magnet, &dir, paused)).await
+                    {
+                        // Named, not "that download": a batch can carry several
+                        // adds, and a user cannot act on a failure they cannot
+                        // attribute to a row.
+                        notices.push(format!("Could not start {infohash} ({e})"));
                         // Tell the supervisor the engine does not actually
                         // have it, so it stops believing otherwise. `Add`
                         // never emits another op that can itself fail, so
@@ -136,7 +191,7 @@ impl Driver {
                     let Some(engine) = self.engine.clone() else {
                         continue;
                     };
-                    if let Err(e) = engine.pause(&infohash).await {
+                    if let Err(e) = bounded(limits::CONTROL, engine.pause(&infohash)).await {
                         notices.push(format!("Could not pause that download ({e})"));
                         // A pause we cannot confirm took effect must fail
                         // closed: this feeds back to a `Kill`, which cannot
@@ -153,7 +208,7 @@ impl Driver {
                     let Some(engine) = self.engine.clone() else {
                         continue;
                     };
-                    if let Err(e) = engine.resume(&infohash).await {
+                    if let Err(e) = bounded(limits::CONTROL, engine.resume(&infohash)).await {
                         notices.push(format!("Could not resume that download ({e})"));
                         // `Resume` only ever updates our own record and emits
                         // no ops, so this cannot recurse further either.
@@ -172,7 +227,9 @@ impl Driver {
                     let Some(engine) = self.engine.clone() else {
                         continue;
                     };
-                    if let Err(e) = engine.remove(&infohash, delete_files).await {
+                    if let Err(e) =
+                        bounded(limits::CONTROL, engine.remove(&infohash, delete_files)).await
+                    {
                         notices.push(format!("Could not remove that download ({e})"));
                         // Same reasoning as the failed pause: fail closed via
                         // `Kill`, which cannot itself fail.
@@ -370,6 +427,131 @@ mod tests {
 
     const AA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const BB: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// An engine whose `add_magnet` never answers for one particular magnet
+    /// and behaves normally for every other call. Magnet resolution over DHT
+    /// on a thinly-seeded torrent really is slow, so this is the ordinary case
+    /// going long, not a broken backend. Opens nothing.
+    struct SlowAddEngine {
+        slow: String,
+        added: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SlowAddEngine {
+        fn new(slow: &str) -> Self {
+            Self {
+                slow: slow.to_string(),
+                added: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn added(&self) -> Vec<String> {
+            self.added.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TorrentEngine for SlowAddEngine {
+        async fn add_magnet(
+            &self,
+            magnet: &str,
+            _output_dir: &std::path::Path,
+            _paused: bool,
+        ) -> Result<crate::engine::InfoHash, crate::engine::EngineError> {
+            if magnet.contains(&self.slow) {
+                std::future::pending::<()>().await;
+            }
+            self.added
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(magnet.to_string());
+            Ok(magnet.to_string())
+        }
+        async fn pause(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn resume(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn remove(
+            &self,
+            _infohash: &str,
+            _delete_files: bool,
+        ) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn snapshot(
+            &self,
+            _infohash: &str,
+        ) -> Result<TorrentSnapshot, crate::engine::EngineError> {
+            Err(crate::engine::EngineError::NotFound("none".into()))
+        }
+        async fn snapshots(&self) -> Vec<TorrentSnapshot> {
+            Vec::new()
+        }
+    }
+
+    struct SlowAddFactory {
+        engine: Arc<SlowAddEngine>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionFactory for SlowAddFactory {
+        async fn build(
+            &self,
+            _device: Option<&str>,
+        ) -> Result<Arc<dyn TorrentEngine>, crate::engine::EngineError> {
+            Ok(Arc::clone(&self.engine) as Arc<dyn TorrentEngine>)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_slow_add_does_not_take_the_other_transfers_down_with_it() {
+        // A tunnel coming back reconciles into a build plus one add per wanted
+        // row, all in one batch. Bounding the batch rather than the call meant
+        // several slow-but-working adds shared one budget, and one slow magnet
+        // tore down every other transfer — collateral damage dressed up as
+        // failing closed. Only the torrent that was slow may suffer for it.
+        const CC: &str = "cccccccccccccccccccccccccccccccccccccccc";
+        let engine = Arc::new(SlowAddEngine::new(BB));
+        let mut d = Driver::new(
+            Arc::new(SlowAddFactory {
+                engine: Arc::clone(&engine),
+            }) as Arc<dyn SessionFactory>,
+            Supervisor::new(BindSupport::Supported),
+        );
+
+        // Wanted while unprotected, so nothing is added yet; the bind below is
+        // the single batch that builds and adds all three.
+        for infohash in [AA, BB, CC] {
+            d.handle(Input::User(Intent::Add(wanted(infohash)))).await;
+        }
+        let notices = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            d.handle(Input::Vpn(GuardAction::Bind {
+                device: "utun4".into(),
+            })),
+        )
+        .await
+        .expect("a slow add must not hold the caller indefinitely");
+
+        assert!(
+            d.session_is_live(),
+            "one slow magnet must not tear the session down: {notices:?}"
+        );
+        assert_eq!(
+            engine.added(),
+            vec![
+                format!("magnet:?xt=urn:btih:{AA}"),
+                format!("magnet:?xt=urn:btih:{CC}"),
+            ],
+            "the torrents that answered must still be in the session"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains(BB)),
+            "the torrent that did not answer must be reported: {notices:?}"
+        );
+    }
 
     #[tokio::test]
     async fn a_failed_add_is_retried_once_the_supervisor_reconciles_again() {
