@@ -736,7 +736,18 @@ impl App {
                     return Vec::new();
                 };
                 let infohash = entry.infohash.clone();
-                vec![Effect::RemoveFromQueue(infohash)]
+                // Two effects, one intent: the queue file is the record of
+                // what the user wants, and the session is what is actually
+                // running. Dropping either half leaves them disagreeing.
+                // `delete_files` stays false — removing a row is not consent
+                // to delete what has already landed on disk.
+                vec![
+                    Effect::RemoveFromQueue(infohash.clone()),
+                    Effect::RemoveDownload {
+                        infohash,
+                        delete_files: false,
+                    },
+                ]
             }
             KeyAction::ClearQueue => {
                 if self.section != Section::Downloads || self.queue.is_empty() {
@@ -973,10 +984,17 @@ mod tests {
         a.set_section(Section::Downloads);
         a.region = Region::Content;
         let effects = a.update(Action::Key(KeyAction::RemoveEntry));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::RemoveFromQueue(h)] if h == &"aa".repeat(20)
-        ));
+        // Removing a row must take the torrent out of the live session as
+        // well as out of the queue file: rewriting the file alone would leave
+        // a running transfer nothing on screen refers to.
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::RemoveFromQueue(h), Effect::RemoveDownload { infohash, delete_files: false }]
+                    if h == &"aa".repeat(20) && infohash == &"aa".repeat(20)
+            ),
+            "{effects:?}"
+        );
     }
 
     #[test]
