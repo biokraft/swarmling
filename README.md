@@ -62,7 +62,11 @@ swarmling --help                    # everything else
 
 `SWARMLING_DATA_DIR` overrides where the queue and settings are kept, if you want more than one profile.
 
-The terminal UI searches every source, sorts and filters the results, and records what you want downloaded. Like `swarmling add`, it writes that intent to the queue file and nothing more: it transfers no data and contacts no peer. Actually moving bytes waits for a later release.
+The terminal UI searches every source, sorts and filters the results, and lets you queue and run downloads: `s` starts the highlighted entry, `p` pauses it. The session lives inside the TUI process — there is no daemon, and nothing transfers once you quit. Restoring a queue from a previous run never starts anything by itself; every entry comes back inert until you press `s`.
+
+A VPN is required. The TUI enforces this itself, watching the tunnel continuously; if it drops, the session is killed outright rather than paused, so any in-flight transfer stops immediately. Partial data already on disk is kept, and reconnecting rebuilds the session and re-checks what is already there instead of re-downloading it. On Windows, traffic cannot be pinned to the tunnel device, so the app runs unbound there and says so persistently in the Downloads panel — it still refuses to start without a confirmed tunnel, but a drop is caught by watching rather than by blocking the socket.
+
+swarmling never seeds: a finished torrent is removed from the session as soon as completion is noticed, which happens on a one-second poll — so a completed torrent can remain reachable for uploads for up to that one second before it is dropped.
 
 Search prints one result per line — seeders, size, title, magnet — as each source answers. A source that is down produces a warning on stderr and the search carries on without it.
 

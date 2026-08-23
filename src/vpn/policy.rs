@@ -36,8 +36,10 @@ pub fn protection_summary(os: &str) -> &'static str {
         }
         BindSupport::Unsupported => {
             "This platform cannot bind traffic to an interface, so swarmling watches the VPN and \
-             will pause every torrent if it drops. That is weaker: traffic can still leak in the \
-             moments before a drop is noticed."
+             stops every torrent if it drops, closing the whole session rather than pausing it: \
+             restarting a download re-checks what is already on disk. That is weaker in both \
+             directions: traffic can still leak in the moments before a drop is noticed, and \
+             nothing resumes by itself afterwards."
         }
     }
 }
@@ -73,7 +75,15 @@ mod tests {
             windows.contains("cannot"),
             "must not overstate Windows protection: {windows}"
         );
-        assert!(windows.contains("pause"));
+        assert!(
+            windows.contains("stops every torrent"),
+            "must describe the stop that actually happens: {windows}"
+        );
+        assert!(
+            !windows.contains("pause"),
+            "swarmling closes the session rather than pausing it, and a user who \
+             expects to resume will instead watch everything re-check: {windows}"
+        );
     }
 
     #[test]

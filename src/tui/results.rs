@@ -342,7 +342,7 @@ mod tests {
     }
 
     fn hash(n: u8) -> String {
-        format!("{:040x}", n)
+        format!("{n:040x}")
     }
 
     #[test]

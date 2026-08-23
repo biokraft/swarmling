@@ -397,12 +397,12 @@ mod tests {
             results: (0..count)
                 .map(|i| crate::sources::SearchResult {
                     title: format!("row {i}"),
-                    magnet: format!("magnet:?xt=urn:btih:{:040x}", i),
+                    magnet: format!("magnet:?xt=urn:btih:{i:040x}"),
                     size_bytes: 1,
                     seeders: 100 - i,
                     leechers: 0,
                     source_id: "yts",
-                    infohash: format!("{:040x}", i),
+                    infohash: format!("{i:040x}"),
                 })
                 .collect(),
         });
@@ -528,19 +528,232 @@ mod tests {
         }
     }
 
+    fn snapshot(
+        infohash: &str,
+        progress_bytes: u64,
+        total_bytes: u64,
+    ) -> crate::engine::TorrentSnapshot {
+        crate::engine::TorrentSnapshot {
+            infohash: infohash.to_owned(),
+            name: "snapshot".into(),
+            state: crate::engine::TorrentState::Downloading,
+            progress_bytes,
+            total_bytes,
+            download_speed: 4096,
+            upload_speed: 0,
+            error: None,
+        }
+    }
+
+    fn entry(infohash: &str) -> crate::download::queue::QueueEntry {
+        entry_titled(infohash, "a queued release")
+    }
+
+    fn entry_titled(infohash: &str, title: &str) -> crate::download::queue::QueueEntry {
+        crate::download::queue::QueueEntry {
+            infohash: infohash.to_owned(),
+            magnet: "magnet:?xt=urn:btih:".to_owned() + infohash,
+            title: title.to_owned(),
+            added_unix: 1_700_000_000,
+            paused: false,
+            source_id: None,
+            dir: None,
+        }
+    }
+
+    /// The detail row rendered immediately below a title line, so a test can
+    /// check one queue entry's progress without the assertion also being
+    /// satisfied by a neighbouring row (which a positional, rather than
+    /// infohash, lookup would do).
+    fn detail_row_for(buf: &ratatui::buffer::Buffer, title: &str) -> String {
+        let lines = lines_of(buf);
+        let idx = lines
+            .iter()
+            .position(|l| l.contains(title))
+            .unwrap_or_else(|| panic!("{title} not on screen:\n{}", lines.join("\n")));
+        lines
+            .get(idx + 1)
+            .cloned()
+            .unwrap_or_else(|| panic!("no detail row after {title}"))
+    }
+
+    fn downloads_app(queue: Vec<crate::download::queue::QueueEntry>) -> App {
+        let mut a = App::new(std::path::PathBuf::from("/tmp/x"), queue);
+        a.update(Action::Key(KeyAction::Enter));
+        a.set_section(crate::tui::app::Section::Downloads);
+        a
+    }
+
     #[test]
-    fn the_downloads_panel_says_nothing_is_transferring() {
-        // There is no session in this milestone. A progress bar would be a
-        // lie, so the panel has to say why nothing is moving.
-        let text = downloads_screen(queue_entry("queued release", None));
-        assert!(text.contains("queued release"), "{text}");
+    fn a_downloading_entry_shows_its_own_progress_not_a_neighbours() {
+        // Two entries, only one snapshot — for "bb". A positional lookup
+        // (snapshots()[0]) would put that 50% on "aa" instead; matching by
+        // infohash must keep it on the right row.
+        let mut a = downloads_app(vec![
+            entry_titled("aa", "row aa"),
+            entry_titled("bb", "row bb"),
+        ]);
+        a.update(Action::SnapshotsUpdated(vec![snapshot("bb", 512, 1024)]));
+        let buf = render(&a, 100, 30);
         assert!(
-            text.contains("queued — downloads start in a later release"),
-            "the read-only state is not explained: {text}"
+            detail_row_for(&buf, "row bb").contains("50%"),
+            "row bb should show 50%: {}",
+            detail_row_for(&buf, "row bb")
         );
+        assert!(
+            !detail_row_for(&buf, "row aa").contains('%'),
+            "row aa has no snapshot and must stay idle: {}",
+            detail_row_for(&buf, "row aa")
+        );
+    }
+
+    #[test]
+    fn the_old_placeholder_is_gone() {
+        // The panel used to promise downloads "in a later release". They are
+        // in this release, and a UI that still says otherwise is lying.
+        let a = downloads_app(vec![entry("aa")]);
+        let text = text_of(&render(&a, 100, 30));
+        assert!(
+            !text.contains("later release"),
+            "stale promise still rendered:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_queue_entry_with_no_snapshot_is_shown_idle_not_fabricated() {
+        // No live session for this entry: it must not claim a transfer that
+        // is not happening.
+        let a = downloads_app(vec![entry("aa")]);
+        let text = text_of(&render(&a, 100, 30));
         assert!(
             !text.contains('%'),
             "a progress figure was invented: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("idle") || text.to_lowercase().contains("queued"),
+            "no idle state shown: {text}"
+        );
+    }
+
+    #[test]
+    fn an_unprotected_tunnel_reads_differently_from_a_protected_one() {
+        // "VPN: " appears in every guard state, so merely finding "vpn" would
+        // pass even if the unprotected branch rendered "connected". Check the
+        // state-specific text instead, in both directions.
+        let mut a = downloads_app(vec![entry("aa")]);
+        a.update(Action::GuardChanged(
+            crate::vpn::guard::GuardState::Unprotected,
+        ));
+        let unprotected = text_of(&render(&a, 100, 30));
+        assert!(
+            unprotected.contains("not connected"),
+            "the unprotected state must say so: {unprotected}"
+        );
+
+        a.update(Action::GuardChanged(
+            crate::vpn::guard::GuardState::Protected {
+                device: "wg0".into(),
+            },
+        ));
+        let protected = text_of(&render(&a, 100, 30));
+        assert!(
+            protected.contains("connected via wg0"),
+            "the protected state must name the device: {protected}"
+        );
+        assert!(
+            !protected.contains("not connected"),
+            "the protected state must not also claim to be unprotected: {protected}"
+        );
+    }
+
+    #[test]
+    fn the_row_budget_accounts_for_a_two_line_header() {
+        // On a BindSupport::Unsupported platform, guard_lines returns TWO
+        // lines (status + note). If the row budget still assumes a one-line
+        // header (the old hardcoded `- 1`), it overcounts by one row's worth
+        // of height and the last download row is truncated or overlaps the
+        // block border. Height chosen so a two-row entry only just fits
+        // above a two-line header, but not above a one-line header's
+        // (wrongly) larger budget.
+        //
+        // inner height = 24 - 2 (borders) = 22.
+        // With a 2-line header: room = (22 - 2) / 2 = 10 rows fit.
+        // With the old, wrong 1-line assumption: room = (22 - 1) / 2 = 10
+        // (rounds down the same here) -- so this exact height doesn't
+        // distinguish them; use a height where the two disagree instead.
+        let entries: Vec<_> = (0..12)
+            .map(|i| entry_titled(&format!("{i:040x}"), &format!("row {i}")))
+            .collect();
+        let mut a = downloads_app(entries);
+        a.update(Action::GuardChanged(
+            crate::vpn::guard::GuardState::Protected {
+                device: "wg0".into(),
+            },
+        ));
+        // inner height = 25 - 2 = 23.
+        // Two-line header: room = (23 - 2) / 2 = 10, so rows 0..10 fit,
+        // "row 9" is the last full row and must be fully present.
+        // One-line assumption: room = (23 - 1) / 2 = 11, one row too many is
+        // attempted, overrunning the block and corrupting "row 9"'s line.
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).expect("test backend");
+        // Render the downloads panel directly (outer area including its own
+        // border), with the OS pinned to "windows" so the
+        // BindSupport::Unsupported, two-line header path runs regardless of
+        // the platform this test actually executes on.
+        let panel = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 25,
+        };
+        terminal
+            .draw(|f| crate::tui::render::downloads::draw_with_os(f, panel, &a, "windows"))
+            .expect("draw");
+        let text = text_of(&terminal.backend().buffer().clone());
+        assert!(
+            text.contains("row 9"),
+            "the last row that should fit was lost or corrupted by an \
+             oversized row budget:\n{text}"
+        );
+        assert!(
+            !text.contains("row 10"),
+            "a row beyond the true budget was drawn, meaning the budget did \
+             not account for the two-line header:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_bind_unsupported_note_survives_a_narrow_panel() {
+        // Render the guard lines directly at a width too small to hold the
+        // status text and the note concatenated on one line — this drives
+        // the actual `Unsupported` branch (via "windows"), which the app-level
+        // tests on this dev machine cannot reach. Putting the note on its own
+        // `Line` means a narrow `Paragraph` clips each line independently
+        // instead of dropping the whole note while the reassuring status
+        // text stays on screen.
+        use ratatui::{backend::TestBackend, widgets::Paragraph, Terminal};
+
+        let lines = crate::tui::render::downloads::guard_lines(
+            &crate::vpn::guard::GuardState::Protected {
+                device: "utun9".into(),
+            },
+            "windows",
+        );
+        assert_eq!(lines.len(), 2, "expected a status line and a note line");
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("test backend");
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new(lines.clone()), f.area()))
+            .expect("draw");
+        let text = text_of(&terminal.backend().buffer().clone());
+        assert!(
+            text.contains("connected via"),
+            "connected status missing at narrow width: {text}"
+        );
+        assert!(
+            text.contains("not pinned"),
+            "the note must survive at narrow width instead of being clipped away: {text}"
         );
     }
 

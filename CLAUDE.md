@@ -17,6 +17,8 @@ Work happens on the `rust` branch. `main` still holds the TypeScript app.
 
 This is project policy, not a style preference: automated transfers of unknown content carry legal exposure for whoever runs the suite, in whichever jurisdiction they run it. Treat it as absolute.
 
+A live session is now constructed in exactly one place in production code: `src/tui/run.rs`, which builds the one `LibrqbitFactory` in the codebase and hands it to a `Driver`. `src/supervisor/factory.rs` is the only other file that names librqbit. Nothing about this weakens the rule above — no test, script, example, or CI step constructs a `LibrqbitEngine` or `LibrqbitFactory` or opens a socket; every test goes through the `SessionFactory` seam and a fake. Manual verification of download behaviour remains a maintainer's job, on their own machine, behind their own VPN. Never yours.
+
 Consequences that shape the whole design:
 - Everything the app needs from a torrent backend goes through the `TorrentEngine` trait (`src/engine/mod.rs`).
 - `src/engine/fake.rs` is an in-memory `FakeEngine` that never opens a socket — the queue, persistence and restore logic are all tested against it.
@@ -45,7 +47,8 @@ Never run `cargo run -- add`, `status`, or `rm` against a real session — see t
 - `src/engine/` — the `TorrentEngine` trait, the fake, and the librqbit adapter. `build_magnet` (in `sources/types.rs`) is the single chokepoint for magnet construction and validates infohashes; nothing else should assemble a magnet.
 - `src/download/` — `queue.rs` (the user's intent, with idempotent adds guarded by an async mutex), `persist.rs` (atomic versioned JSON state), `reconcile.rs` (restore persisted entries into an engine at startup).
 - `src/config/paths.rs` — platform data and download directories via `directories`.
-- `src/main.rs` — clap CLI. **The download subcommands deliberately construct no session**: `add` resolves the infohash locally, `status` and `rm` only read and write the queue file. Live sessions wait for a long-running, VPN-guarded process in a later milestone.
+- `src/main.rs` — clap CLI. **The download subcommands deliberately construct no session**: `add` resolves the infohash locally, `status` and `rm` only read and write the queue file. The only place that constructs a live session is `src/tui/run.rs`, described below.
+- `src/supervisor/` — the live session, held only while the TUI runs. `state.rs` is a pure reconciler: given what the user wants and the tunnel's state, it decides what to build, add, pause, or kill, with no I/O of its own — the VPN dropping produces a kill instruction here, not a pause. `factory.rs` is the seam between that decision layer and a real engine: `SessionFactory` is what tests implement with a fake, and `LibrqbitFactory` is the only production implementer, naming librqbit alongside `src/tui/run.rs`. `driver.rs` holds the one live `Arc<dyn TorrentEngine>` handle in the process and executes the reconciler's instructions against it, with a per-call timeout so a wedged engine call cannot hold the kill switch hostage.
 
 ## House rules
 

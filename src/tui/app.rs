@@ -9,11 +9,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::download::queue::QueueEntry;
+use crate::engine::TorrentSnapshot;
 use crate::sources::magnet::parse_magnet;
 use crate::sources::{registry::all_sources, SourceGroup};
 use crate::tui::action::{Action, Effect, KeyAction};
 use crate::tui::results::Results;
 use crate::tui::textfield::TextField;
+use crate::vpn::guard::GuardState;
 
 /// How long a notice stays on screen.
 const NOTICE_TTL: Duration = Duration::from_secs(4);
@@ -141,6 +143,10 @@ pub struct App {
     /// Which groups each source belongs to, so streamed results can be
     /// classified without asking the registry again on every batch.
     groups: Vec<(&'static str, &'static [SourceGroup])>,
+    /// The live session's latest report about each torrent it carries.
+    snapshots: Vec<TorrentSnapshot>,
+    /// The VPN guard's view of the tunnel.
+    guard: GuardState,
 }
 
 impl App {
@@ -165,11 +171,23 @@ impl App {
             size: (80, 24),
             pending: None,
             groups: all_sources().iter().map(|s| (s.id(), s.groups())).collect(),
+            snapshots: Vec::new(),
+            guard: GuardState::Unprotected,
         }
     }
 
     pub fn notice_text(&self) -> Option<&str> {
         self.notice.as_ref().map(|n| n.text.as_str())
+    }
+
+    /// The live session's latest report about each torrent it carries.
+    pub fn snapshots(&self) -> &[TorrentSnapshot] {
+        &self.snapshots
+    }
+
+    /// The VPN guard's view of the tunnel.
+    pub fn guard_state(&self) -> &GuardState {
+        &self.guard
     }
 
     fn set_notice(&mut self, text: impl Into<String>) {
@@ -307,6 +325,14 @@ impl App {
             Action::QueueChanged(queue) => {
                 self.queue = queue;
                 self.queue_cursor = self.queue_cursor.min(self.queue.len().saturating_sub(1));
+                Vec::new()
+            }
+            Action::SnapshotsUpdated(snapshots) => {
+                self.snapshots = snapshots;
+                Vec::new()
+            }
+            Action::GuardChanged(guard) => {
+                self.guard = guard;
                 Vec::new()
             }
             Action::Key(key) => self.on_key(key),
@@ -710,13 +736,48 @@ impl App {
                     return Vec::new();
                 };
                 let infohash = entry.infohash.clone();
-                vec![Effect::RemoveFromQueue(infohash)]
+                // Two effects, one intent: the queue file is the record of
+                // what the user wants, and the session is what is actually
+                // running. Dropping either half leaves them disagreeing.
+                // `delete_files` stays false — removing a row is not consent
+                // to delete what has already landed on disk.
+                vec![
+                    Effect::RemoveFromQueue(infohash.clone()),
+                    Effect::RemoveDownload {
+                        infohash,
+                        delete_files: false,
+                    },
+                ]
             }
             KeyAction::ClearQueue => {
                 if self.section != Section::Downloads || self.queue.is_empty() {
                     return Vec::new();
                 }
-                vec![Effect::ClearQueue]
+                // Emptying the file is only half of it: a transfer already in
+                // the session would keep running with no row left to pause or
+                // remove it by. One effect, not one per row — the loop caps
+                // the work a single action may cause, and a long queue ran
+                // past that cap. Nothing on disk is deleted, exactly as a
+                // single removal leaves files alone.
+                vec![Effect::ClearQueue, Effect::ClearDownloads]
+            }
+            KeyAction::StartDownload => {
+                if self.section != Section::Downloads {
+                    return Vec::new();
+                }
+                let Some(entry) = self.queue.get(self.queue_cursor) else {
+                    return Vec::new();
+                };
+                vec![Effect::StartDownload(entry.infohash.clone())]
+            }
+            KeyAction::PauseDownload => {
+                if self.section != Section::Downloads {
+                    return Vec::new();
+                }
+                let Some(entry) = self.queue.get(self.queue_cursor) else {
+                    return Vec::new();
+                };
+                vec![Effect::PauseDownload(entry.infohash.clone())]
             }
             KeyAction::Insert(_)
             | KeyAction::Backspace
@@ -929,10 +990,39 @@ mod tests {
         a.set_section(Section::Downloads);
         a.region = Region::Content;
         let effects = a.update(Action::Key(KeyAction::RemoveEntry));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::RemoveFromQueue(h)] if h == &"aa".repeat(20)
-        ));
+        // Removing a row must take the torrent out of the live session as
+        // well as out of the queue file: rewriting the file alone would leave
+        // a running transfer nothing on screen refers to.
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::RemoveFromQueue(h), Effect::RemoveDownload { infohash, delete_files: false }]
+                    if h == &"aa".repeat(20) && infohash == &"aa".repeat(20)
+            ),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn clearing_the_queue_also_clears_the_live_session() {
+        // Emptying the file alone would leave the engine downloading rows the
+        // user can no longer see, with nothing left to pause or remove.
+        let mut a = App::new(
+            PathBuf::from("/tmp"),
+            vec![entry(&"aa".repeat(20)), entry(&"bb".repeat(20))],
+        );
+        a.update(Action::Key(KeyAction::Enter));
+        a.set_section(Section::Downloads);
+        a.region = Region::Content;
+        let effects = a.update(Action::Key(KeyAction::ClearQueue));
+        // Two effects whatever the queue holds. One removal per row would
+        // grow with the queue and run past the cap the loop puts on the work
+        // a single action may cause.
+        assert_eq!(
+            effects,
+            vec![Effect::ClearQueue, Effect::ClearDownloads],
+            "clearing is one instruction to the file and one to the session"
+        );
     }
 
     #[test]
@@ -1240,6 +1330,96 @@ mod tests {
         b.update(Action::Key(KeyAction::EditFilter));
         assert_eq!(b.mode, Mode::Filter);
     }
+    fn entry(infohash: &str) -> crate::download::queue::QueueEntry {
+        crate::download::queue::QueueEntry {
+            infohash: infohash.to_string(),
+            magnet: format!("magnet:?xt=urn:btih:{infohash}"),
+            title: format!("torrent {infohash}"),
+            added_unix: 0,
+            paused: false,
+            source_id: None,
+            dir: None,
+        }
+    }
+
+    fn snapshot(
+        infohash: &str,
+        progress_bytes: u64,
+        total_bytes: u64,
+    ) -> crate::engine::TorrentSnapshot {
+        crate::engine::TorrentSnapshot {
+            infohash: infohash.to_string(),
+            name: format!("torrent {infohash}"),
+            state: crate::engine::TorrentState::Downloading,
+            progress_bytes,
+            total_bytes,
+            download_speed: 1024,
+            upload_speed: 0,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn s_starts_the_highlighted_download() {
+        let mut a = app();
+        a.update(Action::QueueChanged(vec![entry("aa"), entry("bb")]));
+        a.set_section(Section::Downloads);
+        a.region = Region::Content;
+        let effects = a.update(Action::Key(KeyAction::StartDownload));
+        assert!(
+            effects.contains(&Effect::StartDownload("aa".to_string())),
+            "expected a start for the highlighted entry: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn p_pauses_the_highlighted_download() {
+        let mut a = app();
+        a.update(Action::QueueChanged(vec![entry("aa")]));
+        a.set_section(Section::Downloads);
+        a.region = Region::Content;
+        let effects = a.update(Action::Key(KeyAction::PauseDownload));
+        assert!(
+            effects.contains(&Effect::PauseDownload("aa".to_string())),
+            "expected a pause: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn start_and_pause_do_nothing_without_a_selection() {
+        // In the Downloads section with an empty queue, so this actually
+        // reaches the `queue.get(self.queue_cursor)` guard rather than
+        // exiting earlier on the section check.
+        let mut a = app();
+        a.set_section(Section::Downloads);
+        a.region = Region::Content;
+        assert!(a.update(Action::Key(KeyAction::StartDownload)).is_empty());
+        assert!(a.update(Action::Key(KeyAction::PauseDownload)).is_empty());
+    }
+
+    #[test]
+    fn snapshots_are_stored_for_the_downloads_panel() {
+        let mut a = app();
+        a.update(Action::SnapshotsUpdated(vec![snapshot("aa", 512, 1024)]));
+        assert_eq!(a.snapshots().len(), 1);
+        assert_eq!(a.snapshots()[0].progress_bytes, 512);
+    }
+
+    #[test]
+    fn the_guard_state_is_stored() {
+        use crate::vpn::guard::GuardState;
+        let mut a = app();
+        a.update(Action::GuardChanged(GuardState::Protected {
+            device: "utun4".into(),
+        }));
+        assert_eq!(
+            a.guard_state(),
+            &GuardState::Protected {
+                device: "utun4".to_string()
+            }
+        );
+    }
+
     #[test]
     fn quit_is_reachable_from_every_overlay_and_mode() {
         // map_key already produces Quit everywhere and a mapper-level test

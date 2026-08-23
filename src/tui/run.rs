@@ -4,10 +4,13 @@
 //! owns the terminal lifecycle, the `select!` loop, and the execution of the
 //! [`Effect`]s the app asks for.
 //!
-//! **It constructs no torrent engine and no `librqbit::Session`.** In this
-//! milestone a download is a recorded intent: queue effects read and rewrite
-//! the queue *file*, exactly as `swarmling add` does. Nothing here contacts a
-//! tracker, a DHT node, or a peer.
+//! **This is the only file in swarmling that builds a real session.** It
+//! constructs the one [`LibrqbitFactory`] in the codebase and hands it to a
+//! [`Driver`]; everything else — including every test, here and elsewhere —
+//! goes through the `SessionFactory` seam and a fake. A session comes up only
+//! after the guard has confirmed a tunnel *and* the user has pressed start:
+//! restoring the queue file at startup fills the Downloads panel and sends no
+//! intent, so opening swarmling to look at the queue never moves a byte.
 //!
 //! Failures never tear the UI down. A clipboard with no owner, a directory
 //! that cannot be created, a queue file that cannot be written — each becomes
@@ -16,6 +19,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream};
@@ -29,14 +33,61 @@ use crate::download::persist::{load_entries, save_entries};
 use crate::download::queue::QueueEntry;
 use crate::search::{search_all, SearchEvent};
 use crate::sources::registry::all_sources;
+use crate::supervisor::driver::Driver;
+use crate::supervisor::factory::{LibrqbitFactory, SessionFactory};
+use crate::supervisor::{Input, Intent, Supervisor, Wanted};
 use crate::tui::action::{Action, Effect};
 use crate::tui::app::App;
 use crate::tui::event::{map_key, Context};
 use crate::tui::render;
+use crate::vpn::adapter::{VpnAdapter, VpnStatus};
+use crate::vpn::guard::{Guard, GuardAction};
 
 /// How often the app is told what time it is. Notices expire from this tick,
 /// and it is the only clock the app ever sees.
 const TICK: Duration = Duration::from_millis(250);
+
+/// How often the VPN is looked at. The guard is the kill switch, so on a
+/// healthy backend this is the longest a lost tunnel can go unnoticed on a
+/// platform that cannot bind.
+///
+/// The worst case is longer, and saying otherwise would understate a safety
+/// latency. Every branch of the loop runs in one task, so a wedged backend
+/// delays this tick by whatever the branch ahead of it is waiting on:
+///
+/// - a stalled snapshot poll: up to `2 × ENGINE_POLL_LIMIT` (10s) plus this
+///   tick, so about 12s;
+/// - one engine call that never answers: up to that call's own limit in
+///   `supervisor::driver` — 60s for an add, 30s for a build, 10s for a pause,
+///   resume or remove — so about 62s at worst;
+/// - a batch of instructions whose calls each time out: up to
+///   `ENGINE_BATCH_LIMIT`, about 302s, which needs a pathological op list of
+///   several timed-out calls in a row and should never be seen in practice.
+///
+/// After that delay the tunnel is noticed and everything stops. On a platform
+/// that can bind, traffic is pinned to the tunnel device throughout and cannot
+/// leave by another route, so the exposure is real only where binding is
+/// unsupported.
+const VPN_POLL: Duration = Duration::from_secs(2);
+
+/// How often a live session is asked what it is doing. Only runs while a
+/// session exists, so an idle app polls nothing.
+const SESSION_POLL: Duration = Duration::from_secs(1);
+
+/// How long the engine gets to answer a poll. Generous for an in-process
+/// call, and well under the point where a person would call the UI frozen.
+const ENGINE_POLL_LIMIT: Duration = Duration::from_secs(5);
+
+/// A backstop on a whole batch of instructions, not the primary mechanism.
+///
+/// Each engine call is bounded individually inside the driver, where a miss
+/// can be attributed to the torrent that caused it. This is the last resort
+/// for a pathological op list — one long enough that its individually-bounded
+/// calls still add up to minutes — and it is deliberately sized so ordinary
+/// work never reaches it: a batch that trips this has already had every call
+/// inside it time out. Tripping it tears the session down, which is why it
+/// must not be the thing that fires during normal use.
+const ENGINE_BATCH_LIMIT: Duration = Duration::from_secs(300);
 
 /// Leave raw mode and the alternate screen, ignoring errors. Called on the
 /// normal exit path and from the panic hook, so it must be safe to call
@@ -80,6 +131,216 @@ struct Runtime {
     health: HashMap<&'static str, bool>,
     search: Option<mpsc::Receiver<SearchEvent>>,
     quit: bool,
+}
+
+/// The live half of the loop: the VPN it watches, the guard that decides what
+/// that means, and the driver that owns whatever session exists. Kept apart
+/// from [`Runtime`] because none of it may be reachable from a pure effect.
+struct Session {
+    driver: Driver,
+    guard: Guard,
+    adapter: Box<dyn VpnAdapter>,
+    /// Whether the last engine poll went unanswered. Keeps the stall to one
+    /// notice rather than one per tick: a notice storm is its own defect.
+    snapshot_stalled: bool,
+}
+
+/// Every notice the driver produces has to reach the user: a dropped one is a
+/// transfer that silently did not happen.
+fn notices(messages: Vec<String>) -> Vec<Action> {
+    messages.into_iter().map(Action::Notice).collect()
+}
+
+/// Hand one input to the driver, bounded.
+///
+/// `Driver::handle` awaits real engine work — building a session, adding a
+/// magnet, pausing, resuming, removing — and it runs in the same select loop
+/// as the VPN tick. An unbounded call here would hold that loop, so a tunnel
+/// dropping during the hang would never reach the guard while a live session
+/// kept transferring.
+///
+/// The driver bounds every engine call it makes, and a call that misses its
+/// deadline comes back as an ordinary failure — so a slow magnet costs its own
+/// torrent its place and nothing else. This bound is the backstop underneath
+/// that one: it catches only a batch whose calls have each already timed out,
+/// and it escalates, because a batch that long means we can no longer say what
+/// the engine is carrying.
+async fn handle_bounded(session: &mut Session, input: Input) -> Vec<Action> {
+    match tokio::time::timeout(ENGINE_BATCH_LIMIT, session.driver.handle(input)).await {
+        Ok(messages) => notices(messages),
+        Err(_) => notices(
+            session
+                .driver
+                .force_kill(
+                    "the download backend stopped answering, so every transfer was stopped. \
+                     Start them again once it recovers.",
+                )
+                .await,
+        ),
+    }
+}
+
+/// Look at the VPN once and let the guard decide what it means. `status` is
+/// infallible — an adapter that cannot tell reports `VpnStatus::Unknown`,
+/// which the guard treats exactly like a disconnection.
+async fn poll_vpn(session: &mut Session) -> Vec<Action> {
+    // Bounded on purpose. A wedged VPN daemon does not return an error, it
+    // hangs, and this call sits inside the select loop: an unbounded await
+    // here would stop the guard being asked at all, leave a live session
+    // running on a tunnel that may already be gone, and swallow every key
+    // press including the one that quits. An answer that does not arrive is
+    // an answer we do not have, which is what `Unknown` means, and `Unknown`
+    // fails closed.
+    let status = match tokio::time::timeout(VPN_POLL, session.adapter.status()).await {
+        Ok(status) => status,
+        Err(_) => VpnStatus::Unknown("the VPN adapter did not answer in time".into()),
+    };
+    let action = session.guard.observe(&status);
+    // The kill switch firing has to be visible. `SessionOp::Kill` carries its
+    // reason to the driver, which drops the session without a word, so the
+    // announcement is made here — a queue that stops dead with no explanation
+    // reads as a hang.
+    let mut actions = match &action {
+        GuardAction::PauseAll { reason } => {
+            vec![Action::Notice(format!("Stopped every transfer: {reason}"))]
+        }
+        _ => Vec::new(),
+    };
+    actions.extend(handle_bounded(session, Input::Vpn(action)).await);
+    actions.push(Action::GuardChanged(session.guard.state().clone()));
+    actions
+}
+
+/// Ask a live session what it is doing. Silent while none exists, so a fresh
+/// app never reports progress it does not have.
+/// Both polls run in the same `select!` in the same task, so an unbounded
+/// engine call here would hold the loop and, with it, the VPN tick: a tunnel
+/// dropping during the hang would go unnoticed while the session kept
+/// transferring. That is the kill switch defeated through a second door, so
+/// the engine gets a deadline as well.
+///
+/// A missed deadline means "no fresh information this tick", never "protection
+/// failed". The session stays up, the last known snapshots stay on screen, and
+/// the user is told once — not once a second — that the display has gone
+/// stale.
+async fn poll_session(session: &mut Session) -> Vec<Action> {
+    if !session.driver.session_is_live() {
+        return Vec::new();
+    }
+
+    // A read, bounded: if the engine will not say what finished, this tick
+    // simply has no news. Acting on what it did say is a separate step below,
+    // because a completion must not be consumed by a bound that fires halfway
+    // through carrying it out.
+    let finished = match tokio::time::timeout(ENGINE_POLL_LIMIT, session.driver.finished()).await {
+        Ok(finished) => finished,
+        Err(_) => return stalled(session),
+    };
+    let mut completions = Vec::new();
+    for infohash in finished {
+        // Through the same door as every other input, so a removal that does
+        // not answer hits the driver's own `CONTROL` bound, comes back as
+        // `FailedOp::Remove`, and kills the session. Never seed is not a
+        // promise to keep on a best-effort basis.
+        completions.extend(handle_bounded(session, Input::Completed(infohash)).await);
+    }
+    let snapshots = match tokio::time::timeout(ENGINE_POLL_LIMIT, session.driver.snapshots()).await
+    {
+        Ok(snapshots) => snapshots,
+        Err(_) => {
+            let mut actions = completions;
+            actions.extend(stalled(session));
+            return actions;
+        }
+    };
+
+    session.snapshot_stalled = false;
+    let mut actions = completions;
+    actions.push(Action::SnapshotsUpdated(snapshots));
+    actions
+}
+
+/// Report an engine that did not answer in time, at most once per stall.
+fn stalled(session: &mut Session) -> Vec<Action> {
+    if session.snapshot_stalled {
+        return Vec::new();
+    }
+    session.snapshot_stalled = true;
+    vec![Action::Notice(
+        "The download backend is not answering — progress shown may be out of date. \
+         Transfers are still protected."
+            .into(),
+    )]
+}
+
+/// The three effects that touch a real session. Separate from [`perform`]
+/// because they await, and because keeping them here makes it obvious which
+/// effects can move bytes.
+async fn perform_session(effect: Effect, app: &App, session: &mut Session) -> Vec<Action> {
+    let mut actions = Vec::new();
+    match effect {
+        Effect::StartDownload(infohash) => {
+            if !session.driver.knows(&infohash) {
+                let Some(entry) = app.queue.iter().find(|e| e.infohash == infohash) else {
+                    // The row went away between the key press and here.
+                    return vec![Action::Notice("That download is no longer queued".into())];
+                };
+                let wanted = Wanted {
+                    infohash: infohash.clone(),
+                    magnet: entry.magnet.clone(),
+                    dir: entry
+                        .dir
+                        .clone()
+                        .unwrap_or_else(|| app.download_dir.clone()),
+                    // Added paused: an add is a record, and only the start
+                    // below may set it running.
+                    paused: true,
+                };
+                actions.extend(handle_bounded(session, Input::User(Intent::Add(wanted))).await);
+            }
+            actions.extend(handle_bounded(session, Input::User(Intent::Start(infohash))).await);
+        }
+        Effect::PauseDownload(infohash) => {
+            actions.extend(handle_bounded(session, Input::User(Intent::Pause(infohash))).await);
+        }
+        Effect::RemoveDownload {
+            infohash,
+            delete_files,
+        } => {
+            actions.extend(
+                handle_bounded(
+                    session,
+                    Input::User(Intent::Remove {
+                        infohash,
+                        delete_files,
+                    }),
+                )
+                .await,
+            );
+        }
+        Effect::ClearDownloads => {
+            actions.extend(handle_bounded(session, Input::User(Intent::ClearAll)).await);
+        }
+        // Every other effect is `perform`'s. The caller routes by variant,
+        // so getting here means a variant was routed to this function and
+        // then never handled — loud in a debug build rather than silently
+        // dropped, and harmless rather than a panic in a release one.
+        Effect::StartSearch(_)
+        | Effect::AddToQueue { .. }
+        | Effect::RemoveFromQueue(_)
+        | Effect::ClearQueue
+        | Effect::CopyToClipboard(_)
+        | Effect::SaveDownloadDir(_)
+        | Effect::Quit => {
+            debug_assert!(
+                false,
+                "an effect was routed to perform_session that it does not handle"
+            );
+            return Vec::new();
+        }
+    }
+    actions.extend(poll_session(session).await);
+    actions
 }
 
 /// One thing that woke the loop up.
@@ -230,6 +491,14 @@ fn perform(effect: Effect, app: &App, rt: &mut Runtime) -> Vec<Action> {
             }
             vec![Action::DownloadDirChanged(dir)]
         }
+
+        // Handled by `perform_session`, which awaits a real driver. The
+        // caller routes them there; reaching this arm would mean the routing
+        // was lost, so it does nothing rather than pretending to.
+        Effect::StartDownload(_)
+        | Effect::PauseDownload(_)
+        | Effect::RemoveDownload { .. }
+        | Effect::ClearDownloads => Vec::new(),
     }
 }
 
@@ -286,7 +555,7 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 /// Feed one action to the app and perform whatever it asks for, until the
 /// work settles. Effects feed actions back, so this drains a queue rather
 /// than recursing; `LIMIT` stops a pathological cycle from hanging the UI.
-async fn dispatch(action: Action, app: &mut App, rt: &mut Runtime) {
+async fn dispatch(action: Action, app: &mut App, rt: &mut Runtime, session: &mut Session) {
     const LIMIT: usize = 64;
     let mut pending = VecDeque::from([action]);
     let mut steps = 0;
@@ -296,20 +565,28 @@ async fn dispatch(action: Action, app: &mut App, rt: &mut Runtime) {
             break;
         }
         for effect in app.update(action) {
-            if let Effect::StartSearch(query) = effect {
-                app.results.clear();
-                rt.search = Some(search_all(all_sources(), &query).await);
-                continue;
+            match effect {
+                Effect::StartSearch(query) => {
+                    app.results.clear();
+                    rt.search = Some(search_all(all_sources(), &query).await);
+                }
+                Effect::StartDownload(_)
+                | Effect::PauseDownload(_)
+                | Effect::RemoveDownload { .. }
+                | Effect::ClearDownloads => {
+                    pending.extend(perform_session(effect, app, session).await);
+                }
+                effect => pending.extend(perform(effect, app, rt)),
             }
-            pending.extend(perform(effect, app, rt));
         }
     }
 }
 
 /// Run the terminal UI until the user quits.
 ///
-/// Constructs no engine and no session: the queue effects touch the queue
-/// file and nothing else.
+/// Builds the driver that can bring a session up, but brings none up here:
+/// the queue is restored for display only, and the first session can appear
+/// no earlier than the first start the user presses under a confirmed VPN.
 pub async fn run() -> anyhow::Result<()> {
     let queue_path = paths::queue_state_path();
     let settings_path = paths::settings_path();
@@ -319,8 +596,24 @@ pub async fn run() -> anyhow::Result<()> {
     // simply yields the default folder, and `SaveDownloadDir` refuses to
     // overwrite it.
     let cfg = settings::load_result(&settings_path).settings();
-    let download_dir = cfg.download_dir.unwrap_or_else(paths::default_download_dir);
-    let mut app = App::new(download_dir, entries);
+    let download_dir = cfg
+        .download_dir
+        .clone()
+        .unwrap_or_else(paths::default_download_dir);
+    // Restored for display only. No `Intent` is sent here, and `known` starts
+    // empty, so nothing in this queue is running until the user says so.
+    let mut app = App::new(download_dir.clone(), entries);
+
+    let factory: Arc<dyn SessionFactory> = Arc::new(LibrqbitFactory::new(
+        download_dir,
+        paths::data_dir().join("session"),
+    ));
+    let mut session = Session {
+        driver: Driver::new(factory, Supervisor::new(crate::vpn::policy::bind_support())),
+        guard: Guard::new(),
+        adapter: crate::vpn::require::adapter_for(&cfg),
+        snapshot_stalled: false,
+    };
 
     let mut rt = Runtime {
         queue_path,
@@ -344,7 +637,7 @@ pub async fn run() -> anyhow::Result<()> {
     }));
 
     let mut terminal = enter_terminal()?;
-    let result = event_loop(&mut terminal, &mut app, &mut rt).await;
+    let result = event_loop(&mut terminal, &mut app, &mut rt, &mut session).await;
     restore_terminal_best_effort();
     let _ = terminal.show_cursor();
     result
@@ -361,13 +654,18 @@ async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     rt: &mut Runtime,
+    session: &mut Session,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut vpn_ticker = tokio::time::interval(VPN_POLL);
+    vpn_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut session_ticker = tokio::time::interval(SESSION_POLL);
+    session_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     if let Ok(size) = terminal.size() {
-        dispatch(Action::Resize(size.width, size.height), app, rt).await;
+        dispatch(Action::Resize(size.width, size.height), app, rt, session).await;
     }
     terminal.draw(|frame| render::draw(frame, app))?;
 
@@ -381,6 +679,11 @@ async fn event_loop(
             },
             event = next_search(&mut rt.search) => Step::Search(event),
             _ = ticker.tick() => Step::Actions(vec![Action::Tick(Instant::now())]),
+            // The kill switch: this is the only thing that notices a tunnel
+            // going away, so it runs whether or not a session exists.
+            _ = vpn_ticker.tick() => Step::Actions(poll_vpn(session).await),
+            // Progress and completions, only while something is running.
+            _ = session_ticker.tick() => Step::Actions(poll_session(session).await),
         };
 
         let actions = match step {
@@ -394,7 +697,7 @@ async fn event_loop(
         };
 
         for action in actions {
-            dispatch(action, app, rt).await;
+            dispatch(action, app, rt, session).await;
         }
         if rt.quit || app.should_quit {
             break;
@@ -407,6 +710,11 @@ async fn event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::TorrentEngine;
+    use crate::tui::action::KeyAction;
+    use crate::tui::app::{Region, Section};
+    use crate::vpn::guard::GuardState;
+    use crate::vpn::policy::BindSupport;
 
     #[test]
     fn the_panic_hook_restores_the_terminal_before_reporting() {
@@ -420,6 +728,810 @@ mod tests {
         // panic.
         restore_terminal_best_effort();
         restore_terminal_best_effort();
+    }
+
+    fn queued(hash: &str, dir: Option<PathBuf>) -> QueueEntry {
+        QueueEntry {
+            infohash: hash.to_string(),
+            magnet: format!("magnet:?xt=urn:btih:{hash}"),
+            title: "Example".into(),
+            added_unix: 0,
+            paused: false,
+            source_id: None,
+            dir,
+        }
+    }
+
+    /// A session wired to a fake factory and a fake interface list. Opens
+    /// nothing: no test in this file may name the real factory or engine.
+    fn fake_session(
+        interfaces: Arc<crate::vpn::interfaces::FakeInterfaces>,
+    ) -> (Arc<crate::supervisor::factory::FakeFactory>, Session) {
+        let factory = Arc::new(crate::supervisor::factory::FakeFactory::new());
+        let session = Session {
+            driver: Driver::new(
+                Arc::clone(&factory) as Arc<dyn SessionFactory>,
+                Supervisor::new(BindSupport::Supported),
+            ),
+            guard: Guard::new(),
+            adapter: Box::new(crate::vpn::adapter::GenericAdapter::new(interfaces)),
+            snapshot_stalled: false,
+        };
+        (factory, session)
+    }
+
+    fn tunnel(name: &str) -> crate::vpn::interfaces::Interface {
+        crate::vpn::interfaces::Interface {
+            name: name.into(),
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_effect_becomes_a_supervisor_intent() {
+        // The effect must reach the engine, not merely be accepted and
+        // dropped. A silently ignored effect is the defect this catches, and
+        // the stub arm it replaces did exactly that on purpose.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (factory, mut session) = fake_session(interfaces);
+        let hash = "a".repeat(40);
+        let app = App::new(
+            dir.path().to_path_buf(),
+            vec![queued(&hash, Some(dir.path().join("here")))],
+        );
+
+        // The tunnel has to be confirmed before anything may start.
+        poll_vpn(&mut session).await;
+        let actions =
+            perform_session(Effect::StartDownload(hash.clone()), &app, &mut session).await;
+
+        assert!(
+            session.driver.session_is_live(),
+            "a start with a live tunnel must bring the session up: {actions:?}"
+        );
+        assert_eq!(
+            factory.engine().added_magnets().len(),
+            1,
+            "the start effect never reached the engine: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_starts_while_the_tunnel_is_unconfirmed() {
+        // Fail closed: with no VPN observed, a start must refuse and say so
+        // rather than open a session.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "en0",
+        )]));
+        let (factory, mut session) = fake_session(interfaces);
+        let hash = "b".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        let actions = perform_session(Effect::StartDownload(hash), &app, &mut session).await;
+
+        assert!(!session.driver.session_is_live(), "{actions:?}");
+        assert!(factory.engine().added_magnets().is_empty(), "{actions:?}");
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Notice(_))),
+            "a refusal the user cannot see is a silent failure: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_uses_the_folder_recorded_on_the_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (_factory, mut session) = fake_session(interfaces);
+        let hash = "c".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        perform_session(Effect::StartDownload(hash.clone()), &app, &mut session).await;
+        // The default folder stands in when the entry names none; the entry
+        // must not be dropped for want of a directory.
+        assert!(session.driver.knows(&hash));
+    }
+
+    #[tokio::test]
+    async fn removing_an_entry_takes_it_out_of_the_session_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (_factory, mut session) = fake_session(interfaces);
+        let hash = "d".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        perform_session(Effect::StartDownload(hash.clone()), &app, &mut session).await;
+        assert!(session.driver.knows(&hash));
+
+        perform_session(
+            Effect::RemoveDownload {
+                infohash: hash.clone(),
+                delete_files: false,
+            },
+            &app,
+            &mut session,
+        )
+        .await;
+        assert!(
+            !session.driver.knows(&hash),
+            "a removed torrent must stop being one the loop believes is running"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_tunnel_pauses_everything_and_tells_the_user() {
+        // The kill switch has to be visible: a pause the user is not told
+        // about looks like a stall.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (_factory, mut session) = fake_session(Arc::clone(&interfaces));
+        let hash = "e".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        perform_session(Effect::StartDownload(hash), &app, &mut session).await;
+        assert!(session.driver.session_is_live());
+
+        interfaces.set(vec![tunnel("en0")]);
+        let actions = poll_vpn(&mut session).await;
+
+        assert!(
+            !session.driver.session_is_live(),
+            "the session must go down when the tunnel does: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Notice(_))),
+            "the kill switch firing must reach the user: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::GuardChanged(GuardState::Lost { .. }))),
+            "the guard's new state must reach the app: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_poll_is_silent_until_a_session_exists() {
+        // Starting the app must never look like a running transfer.
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![]));
+        let (_factory, mut session) = fake_session(interfaces);
+        assert!(poll_session(&mut session).await.is_empty());
+    }
+
+    /// An adapter that never answers, standing in for a wedged `nordvpnd`.
+    /// Opens nothing and sleeps on the test clock only.
+    struct WedgedAdapter;
+
+    #[async_trait::async_trait]
+    impl VpnAdapter for WedgedAdapter {
+        fn name(&self) -> &'static str {
+            "wedged"
+        }
+        async fn status(&self) -> crate::vpn::adapter::VpnStatus {
+            // Never answers, ever. A daemon that eventually replies would let
+            // this test pass on a paused clock even with no timeout at all.
+            std::future::pending().await
+        }
+        async fn connect(&self) -> Result<(), crate::vpn::adapter::VpnError> {
+            Err(crate::vpn::adapter::VpnError::Unsupported("no".into()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_vpn_adapter_that_never_answers_still_fires_the_kill_switch() {
+        // A wedged `nordvpn status` returns no error - it hangs. Awaiting it
+        // without a bound would hold the whole select loop: the guard would
+        // never be asked, so a dropped tunnel would leave the session running
+        // unprotected, and no key press could stop it. An answer that does not
+        // arrive must be read as `Unknown`, which fails closed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (_factory, mut session) = fake_session(interfaces);
+        let hash = "9".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        perform_session(Effect::StartDownload(hash), &app, &mut session).await;
+        assert!(session.driver.session_is_live());
+
+        session.adapter = Box::new(WedgedAdapter);
+        // The outer bound turns a hang into a failure instead of a suite that
+        // never finishes. Both clocks are virtual, so nothing really waits.
+        let actions = tokio::time::timeout(Duration::from_secs(600), poll_vpn(&mut session))
+            .await
+            .expect("a poll that never returns holds the loop and the kill switch with it");
+
+        assert!(
+            !session.driver.session_is_live(),
+            "an adapter that does not answer must not leave a session running: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::GuardChanged(GuardState::Lost { .. }))),
+            "the guard must be told, not skipped: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Notice(_))),
+            "the user must be told why everything stopped: {actions:?}"
+        );
+    }
+
+    /// An engine that answers every call except the snapshot poll, which never
+    /// returns. Stands in for a wedged backend. Opens nothing.
+    struct WedgedEngine;
+
+    #[async_trait::async_trait]
+    impl crate::engine::TorrentEngine for WedgedEngine {
+        async fn add_magnet(
+            &self,
+            _magnet: &str,
+            _output_dir: &std::path::Path,
+            _paused: bool,
+        ) -> Result<crate::engine::InfoHash, crate::engine::EngineError> {
+            Ok("wedged".to_string())
+        }
+        async fn pause(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn resume(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn remove(
+            &self,
+            _infohash: &str,
+            _delete_files: bool,
+        ) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn snapshot(
+            &self,
+            _infohash: &str,
+        ) -> Result<crate::engine::TorrentSnapshot, crate::engine::EngineError> {
+            std::future::pending().await
+        }
+        async fn snapshots(&self) -> Vec<crate::engine::TorrentSnapshot> {
+            std::future::pending().await
+        }
+    }
+
+    struct WedgedEngineFactory;
+
+    #[async_trait::async_trait]
+    impl SessionFactory for WedgedEngineFactory {
+        async fn build(
+            &self,
+            _device: Option<&str>,
+        ) -> Result<Arc<dyn crate::engine::TorrentEngine>, crate::engine::EngineError> {
+            Ok(Arc::new(WedgedEngine))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_engine_stalls_the_display_without_stalling_the_kill_switch() {
+        // Both polls share one select loop in one task. An unbounded snapshot
+        // call would hold the loop, so the VPN would never be looked at, and a
+        // tunnel dropping during the hang would go unnoticed while the session
+        // kept transferring. A slow poll means no fresh information this tick;
+        // it must never be escalated into a protection failure, and it must
+        // never cost the kill switch its turn.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let mut session = Session {
+            driver: Driver::new(
+                Arc::new(WedgedEngineFactory) as Arc<dyn SessionFactory>,
+                Supervisor::new(BindSupport::Supported),
+            ),
+            guard: Guard::new(),
+            adapter: Box::new(crate::vpn::adapter::GenericAdapter::new(
+                Arc::clone(&interfaces) as Arc<dyn crate::vpn::interfaces::InterfaceProvider>,
+            )),
+            snapshot_stalled: false,
+        };
+        let hash = "7".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        // The start itself must not hang: only the snapshot poll is wedged.
+        let started = tokio::time::timeout(
+            Duration::from_secs(600),
+            perform_session(Effect::StartDownload(hash), &app, &mut session),
+        )
+        .await
+        .expect("a start must not wait on the snapshot poll");
+        assert!(session.driver.session_is_live(), "{started:?}");
+
+        let stalled = tokio::time::timeout(Duration::from_secs(600), poll_session(&mut session))
+            .await
+            .expect("a wedged snapshot poll must not hold the loop");
+
+        assert!(
+            session.driver.session_is_live(),
+            "a slow poll is not a protection failure and must not kill the session: {stalled:?}"
+        );
+        assert!(
+            !stalled
+                .iter()
+                .any(|a| matches!(a, Action::SnapshotsUpdated(_))),
+            "no answer means no fresh snapshots, not empty ones: {stalled:?}"
+        );
+        // Once per stall, not once per tick: a notice storm is its own defect.
+        // The start's own poll is the first tick that meets the wedged engine,
+        // so the announcement belongs to whichever of the two came first, and
+        // to exactly one of them.
+        let again = tokio::time::timeout(Duration::from_secs(600), poll_session(&mut session))
+            .await
+            .expect("still must not hold the loop");
+        let announcements = started
+            .iter()
+            .chain(stalled.iter())
+            .chain(again.iter())
+            .filter(|a| matches!(a, Action::Notice(n) if n.contains("not answering")))
+            .count();
+        assert_eq!(
+            announcements, 1,
+            "a stall must be announced once and then stay quiet: \
+             {started:?} / {stalled:?} / {again:?}"
+        );
+
+        // The point of the whole fix: the kill switch is still reachable.
+        interfaces.set(vec![tunnel("en0")]);
+        let actions = tokio::time::timeout(Duration::from_secs(600), poll_vpn(&mut session))
+            .await
+            .expect("the VPN poll must still get its turn while the engine is wedged");
+        assert!(
+            !session.driver.session_is_live(),
+            "a tunnel lost while the engine is wedged must still stop everything: {actions:?}"
+        );
+    }
+
+    /// An engine whose `add_magnet` never answers. Magnet resolution really is
+    /// long-running, so this is the ordinary call going wrong, not an exotic
+    /// one. Opens nothing.
+    struct StuckAddEngine;
+
+    #[async_trait::async_trait]
+    impl crate::engine::TorrentEngine for StuckAddEngine {
+        async fn add_magnet(
+            &self,
+            _magnet: &str,
+            _output_dir: &std::path::Path,
+            _paused: bool,
+        ) -> Result<crate::engine::InfoHash, crate::engine::EngineError> {
+            std::future::pending().await
+        }
+        async fn pause(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn resume(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn remove(
+            &self,
+            _infohash: &str,
+            _delete_files: bool,
+        ) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn snapshot(
+            &self,
+            _infohash: &str,
+        ) -> Result<crate::engine::TorrentSnapshot, crate::engine::EngineError> {
+            Err(crate::engine::EngineError::NotFound("none".into()))
+        }
+        async fn snapshots(&self) -> Vec<crate::engine::TorrentSnapshot> {
+            Vec::new()
+        }
+    }
+
+    struct StuckAddFactory;
+
+    #[async_trait::async_trait]
+    impl SessionFactory for StuckAddFactory {
+        async fn build(
+            &self,
+            _device: Option<&str>,
+        ) -> Result<Arc<dyn crate::engine::TorrentEngine>, crate::engine::EngineError> {
+            Ok(Arc::new(StuckAddEngine))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_engine_call_never_holds_the_loop() {
+        // `driver.handle` awaits real engine work and sits in the same select
+        // loop as the VPN tick, so a call that never answers must not be able
+        // to hold it. Since the driver bounds each call individually, a single
+        // stuck add is now that torrent's failure alone: the session stays up,
+        // the row is named, and the kill switch keeps its turn.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let mut session = Session {
+            driver: Driver::new(
+                Arc::new(StuckAddFactory) as Arc<dyn SessionFactory>,
+                Supervisor::new(BindSupport::Supported),
+            ),
+            guard: Guard::new(),
+            adapter: Box::new(crate::vpn::adapter::GenericAdapter::new(
+                Arc::clone(&interfaces) as Arc<dyn crate::vpn::interfaces::InterfaceProvider>,
+            )),
+            snapshot_stalled: false,
+        };
+        let hash = "6".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        let actions = tokio::time::timeout(
+            Duration::from_secs(3600),
+            perform_session(Effect::StartDownload(hash.clone()), &app, &mut session),
+        )
+        .await
+        .expect("an engine call that never answers must not hold the loop");
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Notice(n) if n.contains(&hash))),
+            "the torrent that did not answer must be named, not merely counted: {actions:?}"
+        );
+        assert!(
+            session.driver.session_is_live(),
+            "one stuck add is that torrent's problem, not grounds to stop everything: {actions:?}"
+        );
+
+        // The loop is still the loop: the kill switch keeps its turn.
+        interfaces.set(vec![tunnel("en0")]);
+        let after = tokio::time::timeout(Duration::from_secs(3600), poll_vpn(&mut session))
+            .await
+            .expect("the VPN poll must still be reached after a stuck engine call");
+        assert!(
+            !session.driver.session_is_live(),
+            "a tunnel lost after a stuck call must still stop everything: {after:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_of_calls_that_all_hang_still_tears_the_session_down() {
+        // The backstop. Each call is bounded in the driver, so reaching this
+        // needs a whole batch of calls that every one of them timed out — at
+        // which point we can no longer say what the engine is carrying, and
+        // that is what a teardown is for.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![]));
+        let mut session = Session {
+            driver: Driver::new(
+                Arc::new(StuckAddFactory) as Arc<dyn SessionFactory>,
+                Supervisor::new(BindSupport::Supported),
+            ),
+            guard: Guard::new(),
+            adapter: Box::new(crate::vpn::adapter::GenericAdapter::new(
+                Arc::clone(&interfaces) as Arc<dyn crate::vpn::interfaces::InterfaceProvider>,
+            )),
+            snapshot_stalled: false,
+        };
+        let entries: Vec<QueueEntry> = (0..6).map(|i| queued(&format!("{i:040}"), None)).collect();
+        let app = App::new(dir.path().to_path_buf(), entries.clone());
+
+        // Wanted with no tunnel, so nothing is added yet.
+        poll_vpn(&mut session).await;
+        for entry in &entries {
+            perform_session(
+                Effect::StartDownload(entry.infohash.clone()),
+                &app,
+                &mut session,
+            )
+            .await;
+        }
+        assert!(!session.driver.session_is_live());
+
+        // The tunnel arriving reconciles into one batch: a build and six adds,
+        // every one of which hangs.
+        interfaces.set(vec![tunnel("utun4")]);
+        let actions = tokio::time::timeout(Duration::from_secs(3600), poll_vpn(&mut session))
+            .await
+            .expect("even a batch of hanging calls must not hold the loop");
+
+        assert!(
+            !session.driver.session_is_live(),
+            "a batch we cannot account for must be torn down: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Notice(_))),
+            "a session torn down under the user must be explained: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_large_queue_leaves_no_torrent_behind() {
+        // The clear used to fan out to one removal per row. `dispatch` caps
+        // the work one action may cause, so a queue past that cap lost the
+        // tail: rows vanished from the file while their torrents stayed in the
+        // session, with nothing left on screen to stop them by. A big queue is
+        // exactly the queue a user would clear.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (factory, mut session) = fake_session(interfaces);
+        let entries: Vec<QueueEntry> = (0..100)
+            .map(|i| queued(&format!("{i:040}"), None))
+            .collect();
+        let mut app = App::new(dir.path().to_path_buf(), entries.clone());
+        let mut rt = Runtime {
+            queue_path: dir.path().join("queue.json"),
+            settings_path: dir.path().join("settings.json"),
+            health: HashMap::new(),
+            search: None,
+            quit: false,
+        };
+
+        poll_vpn(&mut session).await;
+        for entry in &entries {
+            perform_session(
+                Effect::StartDownload(entry.infohash.clone()),
+                &app,
+                &mut session,
+            )
+            .await;
+        }
+        assert_eq!(factory.engine().added_magnets().len(), 100);
+        assert!(session.driver.session_is_live());
+
+        app.update(Action::Key(KeyAction::Enter));
+        app.set_section(Section::Downloads);
+        app.region = Region::Content;
+        dispatch(
+            Action::Key(KeyAction::ClearQueue),
+            &mut app,
+            &mut rt,
+            &mut session,
+        )
+        .await;
+
+        for entry in &entries {
+            assert!(
+                !session.driver.knows(&entry.infohash),
+                "{} was left in the session after a clear",
+                entry.infohash
+            );
+        }
+        assert!(
+            !session.driver.session_is_live(),
+            "a cleared queue must leave no session running"
+        );
+        assert!(app.queue.is_empty(), "the panel must show the queue empty");
+        assert!(
+            app.snapshots().is_empty(),
+            "the panel must not still be showing transfers that are gone: {} left",
+            app.snapshots().len()
+        );
+        assert!(
+            load_entries(&rt.queue_path).is_empty(),
+            "the queue file must have been rewritten empty"
+        );
+    }
+
+    /// An engine holding one finished torrent whose `remove` never answers.
+    /// Nothing else in the suite hangs a remove, which is exactly why a
+    /// finished torrent could go on seeding unnoticed. Opens nothing.
+    struct StuckRemoveEngine;
+
+    #[async_trait::async_trait]
+    impl crate::engine::TorrentEngine for StuckRemoveEngine {
+        async fn add_magnet(
+            &self,
+            _magnet: &str,
+            _output_dir: &std::path::Path,
+            _paused: bool,
+        ) -> Result<crate::engine::InfoHash, crate::engine::EngineError> {
+            Ok("stuck".to_string())
+        }
+        async fn pause(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn resume(&self, _infohash: &str) -> Result<(), crate::engine::EngineError> {
+            Ok(())
+        }
+        async fn remove(
+            &self,
+            _infohash: &str,
+            _delete_files: bool,
+        ) -> Result<(), crate::engine::EngineError> {
+            std::future::pending().await
+        }
+        async fn snapshot(
+            &self,
+            _infohash: &str,
+        ) -> Result<crate::engine::TorrentSnapshot, crate::engine::EngineError> {
+            Err(crate::engine::EngineError::NotFound("none".into()))
+        }
+        async fn snapshots(&self) -> Vec<crate::engine::TorrentSnapshot> {
+            vec![crate::engine::TorrentSnapshot {
+                infohash: "5".repeat(40),
+                name: "finished".into(),
+                state: crate::engine::TorrentState::Seeding,
+                progress_bytes: 1024,
+                total_bytes: 1024,
+                download_speed: 0,
+                upload_speed: 4096,
+                error: None,
+            }]
+        }
+    }
+
+    struct StuckRemoveFactory;
+
+    #[async_trait::async_trait]
+    impl SessionFactory for StuckRemoveFactory {
+        async fn build(
+            &self,
+            _device: Option<&str>,
+        ) -> Result<Arc<dyn crate::engine::TorrentEngine>, crate::engine::EngineError> {
+            Ok(Arc::new(StuckRemoveEngine))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_that_never_answers_stops_the_session_rather_than_seeding_on() {
+        // Never seed is the promise this whole milestone exists to keep, and a
+        // completion is the one input that used to be able to break it
+        // quietly: the supervisor forgets a finished torrent the moment it is
+        // told, so a removal that does not land leaves the engine seeding with
+        // nobody left believing it is there. A completion must go through the
+        // same fail-closed path as every other input — a remove that does not
+        // answer kills the session, because failing to stop traffic is exactly
+        // when a kill switch is the only answer we trust.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let mut session = Session {
+            driver: Driver::new(
+                Arc::new(StuckRemoveFactory) as Arc<dyn SessionFactory>,
+                Supervisor::new(BindSupport::Supported),
+            ),
+            guard: Guard::new(),
+            adapter: Box::new(crate::vpn::adapter::GenericAdapter::new(
+                Arc::clone(&interfaces) as Arc<dyn crate::vpn::interfaces::InterfaceProvider>,
+            )),
+            snapshot_stalled: false,
+        };
+        let hash = "5".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        // The engine reports the torrent finished from the first look, so the
+        // start's own poll is already the tick that meets the stuck removal.
+        let mut actions = tokio::time::timeout(
+            Duration::from_secs(3600),
+            perform_session(Effect::StartDownload(hash), &app, &mut session),
+        )
+        .await
+        .expect("a removal that never answers must not hold the loop");
+        actions.extend(
+            tokio::time::timeout(Duration::from_secs(3600), poll_session(&mut session))
+                .await
+                .expect("nor on a later tick"),
+        );
+
+        assert!(
+            !session.driver.session_is_live(),
+            "a torrent we cannot take out of the session must stop the session: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Notice(_))),
+            "a session stopped under the user must be explained: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_torrent_can_be_started_again() {
+        // Completion drops the torrent from what the supervisor wants. If the
+        // loop keeps believing it is known, a second start sends no `Add`,
+        // the intent matches nothing, and the key looks broken.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (factory, mut session) = fake_session(interfaces);
+        let hash = "8".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        perform_session(Effect::StartDownload(hash.clone()), &app, &mut session).await;
+        factory.engine().finish(&hash);
+        poll_session(&mut session).await;
+
+        perform_session(Effect::StartDownload(hash.clone()), &app, &mut session).await;
+        assert_eq!(
+            factory.engine().added_magnets().len(),
+            2,
+            "starting a finished row again must reach the engine a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_the_queue_takes_every_transfer_out_of_the_session() {
+        // Emptying the file while the engine keeps downloading leaves no row
+        // to pause or remove: the transfer becomes unreachable from the UI.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (_factory, mut session) = fake_session(interfaces);
+        let one = "1".repeat(40);
+        let two = "2".repeat(40);
+        let app = App::new(
+            dir.path().to_path_buf(),
+            vec![queued(&one, None), queued(&two, None)],
+        );
+
+        poll_vpn(&mut session).await;
+        perform_session(Effect::StartDownload(one.clone()), &app, &mut session).await;
+        perform_session(Effect::StartDownload(two.clone()), &app, &mut session).await;
+
+        for infohash in [one.clone(), two.clone()] {
+            perform_session(
+                Effect::RemoveDownload {
+                    infohash,
+                    delete_files: false,
+                },
+                &app,
+                &mut session,
+            )
+            .await;
+        }
+        assert!(!session.driver.knows(&one));
+        assert!(!session.driver.knows(&two));
+    }
+
+    #[tokio::test]
+    async fn a_finished_torrent_leaves_the_session_and_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let interfaces = Arc::new(crate::vpn::interfaces::FakeInterfaces::new(vec![tunnel(
+            "utun4",
+        )]));
+        let (factory, mut session) = fake_session(interfaces);
+        let hash = "f".repeat(40);
+        let app = App::new(dir.path().to_path_buf(), vec![queued(&hash, None)]);
+
+        poll_vpn(&mut session).await;
+        perform_session(Effect::StartDownload(hash.clone()), &app, &mut session).await;
+        factory.engine().finish(&hash);
+
+        let actions = poll_session(&mut session).await;
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SnapshotsUpdated(_))),
+            "the poll must feed progress back to the app: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Notice(_))),
+            "a download that finished must say so, or it looks like it stalled: {actions:?}"
+        );
+        assert!(
+            factory.engine().snapshots().await.is_empty(),
+            "the point is that it left the session, not that a notice fired"
+        );
     }
 
     #[test]

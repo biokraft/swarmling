@@ -31,6 +31,10 @@ pub enum Action {
     DownloadDirChanged(PathBuf),
     /// The event loop rewrote the queue file; this is its new contents.
     QueueChanged(Vec<QueueEntry>),
+    /// What the live session currently reports about each torrent it carries.
+    SnapshotsUpdated(Vec<crate::engine::TorrentSnapshot>),
+    /// The VPN guard's view of the tunnel changed.
+    GuardChanged(crate::vpn::guard::GuardState),
 }
 
 /// A key press already resolved to its meaning. The terminal layer owns the
@@ -62,6 +66,8 @@ pub enum KeyAction {
     // downloads
     RemoveEntry,
     ClearQueue,
+    StartDownload,
+    PauseDownload,
     // text editing
     Insert(String),
     Backspace,
@@ -93,6 +99,16 @@ pub enum Effect {
     },
     RemoveFromQueue(String),
     ClearQueue,
+    StartDownload(String),
+    PauseDownload(String),
+    RemoveDownload {
+        infohash: String,
+        delete_files: bool,
+    },
+    /// Take everything out of the live session at once. One effect rather than
+    /// one removal per row: the loop caps the work a single action may cause,
+    /// and a long queue used to run past that cap.
+    ClearDownloads,
     CopyToClipboard(String),
     SaveDownloadDir(PathBuf),
     Quit,
